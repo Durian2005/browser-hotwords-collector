@@ -1,0 +1,166 @@
+# ============================================================
+# 高热度词条采集 —— 源配置（声明式）
+# ------------------------------------------------------------
+# 新增一个源 = 在这里加一段配置 + 注册一个 parser，不改主流程。
+#
+# 字段说明：
+#   id           唯一标识，用作 DB 里 source 字段，禁止改动（历史数据依赖）
+#   name         中文名，仅用于展示
+#   enabled      是否启用
+#   type         本期固定 static_json（静态 JSON 接口）
+#                （保留扩展位：html / dynamic，供后续 DynamicFetcher 用）
+#   interval_min 抓取间隔（分钟）
+#   request      url / headers / timeout
+#   parser       parser 注册名（见 hotwords/parsers/）
+#   assertions   结构断言：解析后必须满足，否则判定为"解析失效"并入告警
+#   # 合规留档 -------------------------------------------------
+#   robots_checked    探测日期
+#   robots_note       robots 探测结论（留档作为合规证据）
+# ============================================================
+
+version: 1
+
+defaults:
+  timeout: 15
+  retry:
+    max_attempts: 3
+    backoff_base: 1.0      # 秒，指数退避 1 -> 2 -> 4
+    retry_on_status: [429, 500, 502, 503, 504]   # 403/401 不重试
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+sources:
+  # ----------------------------------------------------------
+  # 百度热搜：一个接口可拿多个垂直榜（tab 参数）
+  # 实测 2026-10-09：200 / 22.7KB / 4.7s
+  # robots：top.baidu.com/robots.txt 返回 404（不存在）；
+  #         www.baidu.com/robots.txt 存在但只约束 /baidu、/s? 等路径，
+  #         未限制 top.baidu.com/api/board → 采集合规留档
+  # ----------------------------------------------------------
+  - id: baidu_hot
+    name: 百度热搜榜
+    enabled: true
+    type: static_json
+    interval_min: 5
+    parser: baidu
+    request:
+      url: "https://top.baidu.com/api/board?platform=wise&tab={tab}"
+      headers:
+        Referer: "https://top.baidu.com/board"
+      # 同一接口不同榜单，展开为多个采集任务
+      # 实测有效（2026-10-09）：realtime=51 / teleplay=10 / movie=10
+      #                         novel=30 / car=30
+      # 实测无效：game、tv（platform=wise）
+      tabs:
+        - realtime    # 实时热搜（含置顶，共 51 条）
+        - teleplay    # 电视剧榜
+        - movie       # 电影榜
+        - novel       # 小说榜
+    assertions:
+      min_items: 10
+      # ⚠️ 同接口不同榜单字段名不同：热搜是 word，垂直榜是 title
+      # 用 required_fields_any 表达"至少一个有值即通过"
+      required_fields_any: [word, title]
+    robots_checked: "2026-10-09"
+    robots_note: "top.baidu.com/robots.txt 404；www.baidu.com/robots.txt 未覆盖本接口。注意：该接口偶发网络超时会返回空，需依赖重试机制"
+
+  # ----------------------------------------------------------
+  # B站热搜：最稳最快，建议作为"基线源"
+  # 实测 2026-10-09：200 / 4.1KB / 0.2s / 无需 Referer
+  # ----------------------------------------------------------
+  - id: bilibili_hot
+    name: B站热搜
+    enabled: true
+    type: static_json
+    interval_min: 5
+    parser: bilibili
+    request:
+      url: "https://api.bilibili.com/x/web-interface/search/square?limit=30"
+      headers:
+        Referer: "https://www.bilibili.com/"
+    assertions:
+      min_items: 10
+      required_fields: [keyword]      # B站字段是 keyword/show_name，不是 word
+    robots_checked: "2026-10-09"
+    robots_note: "公开 API，实测无需 Referer 亦可，带上更稳"
+
+  # ----------------------------------------------------------
+  # 微博热搜：需 Referer + 移动端 UA，否则 403
+  # 实测 2026-10-09：裸请求 403 → 带 Referer+iPhone UA 200 / 19.5KB
+  # 注意：这是"请求头缺失"而非"反爬武器"问题，不要误上 StealthyFetcher
+  # ----------------------------------------------------------
+  - id: weibo_hot
+    name: 微博热搜榜
+    enabled: true          # V2 再开（V1 先用百度+B站跑通）
+    type: static_json
+    interval_min: 10
+    parser: weibo
+    request:
+      url: "https://weibo.com/ajax/side/hotSearch"
+      headers:
+        Referer: "https://weibo.com/"
+        Accept: "application/json, text/plain, */*"
+        User-Agent: "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    assertions:
+      min_items: 10
+      required_fields: [word]
+    robots_checked: "2026-10-09"
+    robots_note: "403 由缺失 Referer 导致，非技术措施；降频至 10min"
+
+  # ----------------------------------------------------------
+  # 抖音热榜（V2）
+  # 实测 2026-10-09：200 / 65.8KB / 2.0s
+  # ----------------------------------------------------------
+  - id: douyin_hot
+    name: 抖音热榜
+    enabled: true
+    type: static_json
+    interval_min: 10
+    parser: douyin
+    request:
+      url: "https://www.douyin.com/aweme/v1/web/hot/search/list/"
+      headers:
+        Referer: "https://www.douyin.com/"
+    assertions:
+      min_items: 10
+      required_fields: [word]
+    robots_checked: "2026-10-09"
+    robots_note: "终端可直连，可能被限速"
+
+  # ----------------------------------------------------------
+  # 头条热榜（V2）
+  # 实测 2026-10-09：200 / 125KB / 2.0s
+  # ----------------------------------------------------------
+  - id: toutiao_hot
+    name: 头条热榜
+    enabled: true
+    type: static_json
+    interval_min: 10
+    parser: toutiao
+    request:
+      url: "https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc"
+      headers:
+        Referer: "https://www.toutiao.com/"
+    assertions:
+      min_items: 10
+      required_fields: [Title]     # ⚠️ 头条字段名首字母大写，断言查的是原始 raw 字典
+    robots_checked: "2026-10-09"
+    robots_note: "公开接口；有 fixed_top_data 置顶条目需单独处理"
+
+  # ----------------------------------------------------------
+  # 知乎热榜：实测 401，需登录态/签名 → 暂不纳入
+  # ----------------------------------------------------------
+  - id: zhihu_hot
+    name: 知乎热榜
+    enabled: false
+    type: dynamic          # 需渲染/带 Cookie，非 V1 范围
+    interval_min: 30
+    parser: zhihu
+    request:
+      url: "https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=20"
+      headers:
+        Referer: "https://www.zhihu.com/hot"
+    assertions:
+      min_items: 5
+      required_fields: [word]
+    robots_checked: "2026-10-09"
+    robots_note: "401 未授权，需登录态；标记为 dynamic 类型暂不启用"
