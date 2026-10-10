@@ -23,7 +23,12 @@ class Repository:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
+        # check_same_thread=False 是必需的，不是图省事：
+        # APScheduler 在线程池里执行 job，而连接是在主线程创建的，
+        # 默认设置下第一轮就会抛 ProgrammingError 且被吞成"静默失败"。
+        # 安全性依据：调度器为单 job（max_instances=1）串行执行，
+        # 同一时刻只有一个线程在用这个连接，不存在并发写。
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
 
