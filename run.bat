@@ -103,6 +103,14 @@ echo.
 echo   Running scheduler (full round, Ctrl+C to stop).
 echo   Log: logs\scheduler.log
 "%PY%" -m hotwords --log-file logs\scheduler.log run
+set "RC=%ERRORLEVEL%"
+echo   [scheduler exited] exit code=%RC%
+REM NOTE: the space between %RC% and >> is required. Written as "%RC%>>file"
+REM cmd does NOT recognize the redirect: output goes to the console, the variable
+REM expands to nothing, and the file stays empty (verified empirically).
+REM %DATE:~0,10% instead of %DATE%: the latter appends a localized weekday
+REM (e.g. a CJK string) that lands in the file as mojibake.
+echo %DATE:~0,10% %TIME%  exit code=%RC% >>"logs\last_exit.txt"
 goto done
 
 :test

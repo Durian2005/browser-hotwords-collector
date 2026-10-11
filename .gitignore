@@ -32,3 +32,6 @@ __pycache__/
 # ---------- 日志与临时文件 ----------
 *.log
 *.tmp
+# 运行期诊断产物：scheduler.log / scheduler.log.crash（faulthandler）/
+# last_exit.txt（退出码）。*.log 盖不住后两者，所以整个目录一起忽略。
+logs/
