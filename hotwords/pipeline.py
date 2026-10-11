@@ -83,7 +83,20 @@ class Pipeline:
                 # 断言失败仍然落库（可能是降级数据），便于事后 rescue
             else:
                 # 字段漂移检测（仅断言通过时才更新指纹，避免污染基线）
-                drift = self.repo.check_drift(result)
+                # 关键字段直接复用断言配置 —— 那本来就是"产出 item 所依赖的字段"
+                # 的权威声明，另维护第二份清单迟早会不一致。
+                #
+                # ⚠️ 配了 required_fields_any 就说明"字段名因榜单而异"
+                # （百度 realtime 用 word、垂直榜用 title），此时**不能**再套用
+                # required_fields 的默认值 ["word"]，否则三个垂直榜会每轮误报
+                # "关键字段缺失: ['word']" —— 实测踩到，差点把修好的漂移检测
+                # 又变成另一个噪声源。
+                drift = self.repo.check_drift(
+                    result,
+                    must_have=(None if src.assertions.required_fields_any
+                               else src.assertions.required_fields),
+                    any_of=src.assertions.required_fields_any,
+                )
                 if drift:
                     d = f"[{src.id}/{category}] 字段漂移: {drift}"
                     logger.warning(d)
