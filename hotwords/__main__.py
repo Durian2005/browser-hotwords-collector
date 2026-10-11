@@ -27,6 +27,19 @@ def _setup_logging(verbose: bool, log_file: str | None = None) -> None:
         p = Path(log_file)
         p.parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(p, encoding="utf-8"))
+
+        # 原生崩溃（libcurl 段错误这类）不会产生 Python traceback，
+        # 表现就是"日志凭空断掉"，事后无法区分「崩溃」与「被人 Ctrl+C」。
+        # 实测踩到：2026-10-11 挂机中途停跑，只能靠与手动 Ctrl+C 的日志
+        # 签名逐行比对来推断原因。faulthandler 把 C 层崩溃也落到独立文件，
+        # 下次出现"断尾"时先看这里有没有东西即可一眼定性。
+        import faulthandler
+
+        crash_path = p.with_name(p.name + ".crash")
+        faulthandler.enable(
+            file=open(crash_path, "a", encoding="utf-8"),  # noqa: SIM115 - 需常驻
+            all_threads=True,
+        )
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format=LOG_FMT,

@@ -17,7 +17,10 @@
 """
 from __future__ import annotations
 
+import atexit
 import logging
+import signal
+from typing import Any
 
 from hotwords.pipeline import Pipeline, build_pipeline
 
@@ -71,10 +74,73 @@ def run_forever(
     )
     logger.info("首轮将在 %d 分钟后触发（不立即跑，先手动验证一轮）", iv)
 
+    _install_exit_diagnostics(sched)
+
     try:
         sched.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("调度器已停止")
+
+
+# ============================================================
+# 退出诊断
+# ============================================================
+def _log_stop(signum: int, sched: Any) -> None:
+    """收到中断信号时的收尾（拆成模块级函数便于单测）。"""
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:  # 平台私有信号号
+        name = str(signum)
+    logger.warning("调度器收到信号 %s，正在停止 —— 这是被中断，不是崩溃", name)
+    try:
+        # wait=True：等当前这一轮写库完成再退，避免留下半截事务
+        sched.shutdown(wait=True)
+    except Exception:  # noqa: BLE001 - 退出路径不能再抛异常
+        logger.debug("shutdown 期间出错，忽略", exc_info=True)
+    raise SystemExit(0)
+
+
+def _log_atexit() -> None:
+    """进程正常退出时的收尾（拆成模块级函数便于单测）。"""
+    logger.warning(
+        "调度器进程退出（atexit）—— 若上一行不是「收到信号」，"
+        "说明是被强杀（taskkill /F、任务管理器结束任务）或发生原生崩溃；"
+        "后者会有 traceback 落在 <日志文件>.crash"
+    )
+
+
+def _install_exit_diagnostics(sched: Any) -> None:
+    """让「调度器为什么退出」在日志里留下确定痕迹。
+
+    ⚠️ 为什么需要（实测踩到）：APScheduler 的 BlockingScheduler.start()
+    自己就把 Ctrl+C 吞掉了 —— 下面那句
+        except (KeyboardInterrupt, SystemExit): logger.info("调度器已停止")
+    【从来没有执行过】，日志里也就永远找不到「调度器已停止」。
+    于是 2026-10-11 那次挂机中途停跑，日志只干净地断在「最后一轮成功」
+    的尾巴上，事后只能逐一比对手动 Ctrl+C 的日志签名，才推断出「是人按的」
+    而不是「它自己崩的」。
+
+    对一个要挂十几个小时、无人值守的工具来说，停跑却无法归因是不可接受的，
+    所以补三层，各自负责一类退出：
+      1) 信号处理：Ctrl+C / Ctrl+Break / 关闭控制台 -> 明确写一行
+      2) atexit  ：任何正常退出（含 sys.exit）-> 写一行收尾
+      3) faulthandler（在 __main__._setup_logging 里开）-> 原生崩溃留 traceback
+    三层合起来，日志断尾时可直接定性，不再需要靠猜。
+    """
+
+    def _handler(signum: int, _frame: Any) -> None:
+        _log_stop(signum, sched)
+
+    for signame in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, signame, None)
+        if sig is None:  # 平台没有该信号（如 Windows 无 SIGHUP）
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):  # 非主线程 / 平台不支持
+            logger.debug("无法注册 %s 处理器，跳过", signame, exc_info=True)
+
+    atexit.register(_log_atexit)
 
 
 def _run_full_round(pipeline: Pipeline) -> None:

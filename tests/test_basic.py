@@ -380,6 +380,75 @@ def test_drift_any_of_and_bulk_change():
             repo.close()
 
 
+def test_scheduler_stop_diagnostics():
+    """中断/退出路径必须留下可归因的日志（事故直接教训）。
+
+    背景：2026-10-11 挂机中途停跑，日志干净地断在「最后一轮成功」，
+    既没有异常也没有「调度器已停止」，只能靠与手动 Ctrl+C 比对签名
+    才推断出原因。这里锁死：收到信号必须写 WARNING + 收尾 + SystemExit，
+    且 shutdown 自身出错不能影响退出。
+    """
+    import logging
+    import signal as _signal
+
+    from hotwords.scheduler import _log_atexit, _log_stop
+
+    class Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    class FakeSched:
+        def __init__(self, boom=False):
+            self.calls: list[bool] = []
+            self.boom = boom
+
+        def shutdown(self, wait=True):
+            self.calls.append(wait)
+            if self.boom:
+                raise RuntimeError("boom")
+
+    lg = logging.getLogger("hotwords.scheduler")
+    grab = Grab()
+    old_level = lg.level
+    lg.addHandler(grab)
+    lg.setLevel(logging.DEBUG)
+    try:
+        # 1) 收到 SIGINT：写 WARNING、shutdown(wait=True)、以 SystemExit(0) 结束
+        fs = FakeSched()
+        try:
+            _log_stop(int(_signal.SIGINT), fs)
+        except SystemExit as e:
+            assert e.code == 0
+        else:
+            raise AssertionError("_log_stop 必须以 SystemExit 结束进程")
+        assert fs.calls == [True], f"应当 shutdown(wait=True)，实际 {fs.calls}"
+        msgs = [r.getMessage() for r in grab.records]
+        assert any("SIGINT" in m and "中断" in m for m in msgs), msgs
+        assert all(r.levelno == logging.WARNING for r in grab.records), msgs
+
+        # 2) shutdown 抛异常也必须照样退出（退出路径不能再炸）
+        try:
+            _log_stop(int(_signal.SIGINT), FakeSched(boom=True))
+        except SystemExit as e:
+            assert e.code == 0
+        else:
+            raise AssertionError("shutdown 失败时也必须 SystemExit")
+
+        # 3) atexit 收尾也要留 WARNING
+        grab.records.clear()
+        _log_atexit()
+        assert grab.records, "atexit 收尾必须写日志"
+        last = grab.records[-1]
+        assert last.levelno == logging.WARNING and "atexit" in last.getMessage()
+    finally:
+        lg.removeHandler(grab)
+        lg.setLevel(old_level)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
