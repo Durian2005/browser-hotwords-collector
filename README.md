@@ -216,7 +216,7 @@ SQL 过滤统计，不必回头解析 raw。
 
 ---
 
-## 实测踩坑记录（2026-10-09 / 10-10）
+## 实测踩坑记录（2026-10-09 / 10-10 / 10-11）
 
 这一节是最有产出的部分 —— 都是真机跑出来的，不是推测。
 
@@ -396,6 +396,71 @@ curl: (77) error adding trust anchors from locations:
 等于把刚修好的噪声换了个来源。所以配了 `any_of` 的源不再套用 `must_have`。
 
 → 效果：修复后再跑 2 轮采集，`schema_drift` **0 条**（此前微博每轮必报）。
+
+---
+
+### 坑 19 ⭐ · 停跑却无法归因：APScheduler 把 Ctrl+C 吞掉了（2026-10-11）
+
+挂机到 10:58 突然停了，而**日志干净地断在"最后一轮成功"的尾巴上**：
+没有 traceback、没有 `调度器已停止`、Windows 事件日志零错误、电源事件显示
+期间从未休眠、那个 cmd 窗口还活着停在 `Press any key to close`。
+
+`scheduler.py` 里明明写着
+
+```python
+try:
+    sched.start()
+except (KeyboardInterrupt, SystemExit):
+    logger.info("调度器已停止")
+```
+
+但这一行**从来没有出现在日志里** —— APScheduler 的 `BlockingScheduler.start()`
+自己就消化了 Ctrl+C，根本不会抛到我们的 `except`。于是"崩溃"与"被人按了
+Ctrl+C"在日志上**完全无法区分**，最后是靠逐行比对昨天手动 Ctrl+C 的日志签名
+（同样断在 `Job executed successfully` 之后、同样没有停止那一行）才推断出是人按的。
+
+对一个要挂十几小时、无人值守的工具，这种盲区不可接受。补三层，各管一类退出：
+
+| 层 | 位置 | 负责的退出方式 |
+|---|---|---|
+| 信号处理（SIGINT / SIGTERM / SIGBREAK） | `scheduler._install_exit_diagnostics` | Ctrl+C、Ctrl+Break、关闭控制台 |
+| `atexit` | 同上 | 任何正常退出（含 `sys.exit`） |
+| `faulthandler` | `__main__._setup_logging` | 原生崩溃（libcurl 段错误这类没有 Python traceback 的） |
+
+效果——现在停跑会留下确定痕迹：
+
+```
+WARNING hotwords.scheduler | 调度器收到信号 SIGINT，正在停止 —— 这是被中断，不是崩溃
+WARNING hotwords.scheduler | 调度器进程退出（atexit）
+```
+
+若只看到 atexit 那行、没有"收到信号"，那就是被强杀（`taskkill /F`、任务管理器）
+或原生崩溃；后者还会有 traceback 落在 `logs/scheduler.log.crash`。
+
+`run.bat` 同时把退出码追加进 `logs/last_exit.txt`，用于区分"干净退出"与"非零退出"。
+
+### 坑 20 · `%VAR%>>file` 在 cmd 下重定向**静默失效**（2026-10-11）
+
+给 `run.bat` 加退出码记录时写的是：
+
+```bat
+echo %DATE% %TIME%  exit code=%RC%>>"logs\last_exit.txt"
+```
+
+实测结果：**输出跑到控制台、变量展开成空、目标文件 0 字节** —— 三个错误同时发生，
+却没有任何报错。穷举对比后确认 `%RC%` 紧贴 `>>` 时 cmd 不识别重定向：
+
+| 写法 | 结果 |
+|---|---|
+| `echo x=%RC%>>"f"` | ❌ 文件空，内容跑到控制台，`%RC%` 为空 |
+| `echo x=%RC% >>"f"` | ✅ 正常写入 |
+| `>>"f" echo x=%RC%` | ✅ 正常写入 |
+| `(echo x=%RC%)>>"f"` | ✅ 正常写入 |
+
+**`%RC%` 与 `>>` 之间那个空格是必需的**，不是风格问题。
+
+另一个连带发现：`%DATE%` 在中文 Windows 下是 `2026/10/11 周日`，那个星期几
+按 GBK 写进文件就是乱码。改用 `%DATE:~0,10%` 只取日期部分，得到纯 ASCII。
 
 ---
 
