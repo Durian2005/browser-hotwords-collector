@@ -194,16 +194,33 @@ def test_weibo_ad_flag():
 
 
 def test_douyin_label_map():
-    """抖音 label 是内部数字枚举：只映射有把握的，未确认的一律 None（不猜）。"""
+    """抖音 label 全量映射为中文徽标，且原始数字进 label_id。
+
+    这条测试的前身锁的是旧立场「只映射有把握的 1/3，其余一律 None（不猜）」。
+    那个立场本身没错，但前提变了：2026-10-11 找到了不需要猜的证据 ——
+    每条带 label 的条目都附徽标图 .../hotspot_detail_page/<label>.png，
+    下载放大后 8 个值全部肉眼可读（见 labels.py / README 坑 21）。
+    所以行为从"留空"改为"全量映射"，测试随之更新；
+    但「未知值仍必须 None」这条底线保留不变。
+    """
     payload = {"data": {"word_list": [
         {"word": "甲", "hot_value": 1, "label": 1},
         {"word": "乙", "hot_value": 2, "label": 3},
-        {"word": "丙", "hot_value": 3, "label": 9},
+        {"word": "丙", "hot_value": 3, "label": 9, "word_sub_board": [3]},
+        {"word": "丁", "hot_value": 4, "label": 17},
+        {"word": "戊", "hot_value": 5, "label": 999},   # 未出现过的枚举
+        {"word": "己", "hot_value": 6},                  # 无 label
     ]}}
     r = get_parser("douyin")(payload, "douyin_hot", "main")
-    assert r.items[0].label == "新"
-    assert r.items[1].label == "热"
-    assert r.items[2].label is None
+    assert r.items[0].label == "新" and r.items[0].label_id == 1
+    assert r.items[1].label == "热" and r.items[1].label_id == 3
+    assert r.items[2].label == "挑战" and r.items[2].label_id == 9
+    assert r.items[2].sub_board == "[3]"
+    assert r.items[3].label == "热议" and r.items[3].label_id == 17
+    # 底线：没见过的枚举值不能瞎编，中文名必须留空（但 id 原样保留）
+    assert r.items[4].label is None and r.items[4].label_id == 999
+    assert r.items[5].label is None and r.items[5].label_id is None
+    assert r.items[5].sub_board is None
 
 
 def test_toutiao_marks_and_category():
@@ -247,14 +264,69 @@ def test_snapshot_marks_roundtrip():
         try:
             rid = repo.start_run()
             items = [HotItem(source="weibo_hot", category="main", rank=1, word="广告词",
-                             is_ad=True, topic_category="综艺")]
+                             is_ad=True, topic_category="综艺"),
+                     HotItem(source="douyin_hot", category="main", rank=2, word="挑战词",
+                             label="挑战", label_id=9, sub_board="[3]")]
             repo.save_snapshot(rid, ParseResult("weibo_hot", "main", items, {"word"}))
             row = repo.conn.execute(
-                "SELECT is_ad, is_top, topic_category FROM snapshot"
+                "SELECT is_ad, is_top, topic_category, label_id, sub_board "
+                "FROM snapshot WHERE word='广告词'"
             ).fetchone()
             assert row["is_ad"] == 1
             assert row["is_top"] == 0
             assert row["topic_category"] == "综艺"
+            assert row["label_id"] is None and row["sub_board"] is None
+            row2 = repo.conn.execute(
+                "SELECT label, label_id, sub_board FROM snapshot WHERE word='挑战词'"
+            ).fetchone()
+            assert row2["label"] == "挑战"
+            assert row2["label_id"] == 9
+            assert row2["sub_board"] == "[3]"
+        finally:
+            repo.close()
+
+
+def test_label_exclude_is_item_level():
+    """条目级排除：带指定徽标的条目不入 word_track，但榜内其它条目照常。
+
+    这是坑 21 的核心回归点。与榜单级排除（track_exclude，整张 tab 排除）
+    的区别必须守住：抖音「挑战」活动和真实热搜混在同一张榜里，
+    若误用榜单级排除会把整张抖音榜一起扔掉。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.storage import Repository
+    from hotwords.analysis import track_persistence, load_persistence
+    from hotwords.models import HotItem, ParseResult
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            rid = repo.start_run()
+            items = [
+                HotItem(source="douyin_hot", category="main", rank=1, word="真实热点",
+                        label="热", label_id=3),
+                HotItem(source="douyin_hot", category="main", rank=2, word="活动话题",
+                        label="挑战", label_id=9, sub_board="[3]"),
+                HotItem(source="baidu_hot", category="realtime", rank=1, word="跨源热点"),
+            ]
+            repo.save_snapshot(rid, ParseResult("douyin_hot", "main", items, {"word"}))
+            repo.upsert_words(items)
+            repo.finish_run(rid, "ok", {})
+            # 只排除"抖音 + label_id=9"，榜单与其它源都不受影响
+            track_persistence(repo, rid, exclude_labels={("douyin_hot", 9)})
+
+            words = {r.word for r in load_persistence(repo, limit=10)}
+            assert "真实热点" in words, "同榜的真实热搜不能被牵连"
+            assert "跨源热点" in words, "其它源不能被牵连"
+            assert "活动话题" not in words, "带排除徽标的条目不应进入持续榜"
+
+            # 但证据层必须完整：快照里那条必须还在
+            n = repo.conn.execute(
+                "SELECT COUNT(*) c FROM snapshot WHERE word='活动话题'"
+            ).fetchone()["c"]
+            assert n == 1, "只排除统计，不排除采集"
         finally:
             repo.close()
 
@@ -306,14 +378,19 @@ def test_legacy_db_migration():
         repo = Repository(p)
         try:
             cols = {r["name"] for r in repo.conn.execute("PRAGMA table_info(snapshot)")}
-            assert {"is_ad", "is_top", "topic_category"} <= cols
+            assert {"is_ad", "is_top", "topic_category", "label_id", "sub_board"} <= cols
             wt = {r["name"] for r in repo.conn.execute("PRAGMA table_info(word_track)")}
             assert {"is_ad", "is_top"} <= wt
             row = repo.conn.execute(
-                "SELECT is_ad, is_top, topic_category FROM snapshot"
+                "SELECT is_ad, is_top, topic_category, label_id, sub_board FROM snapshot"
             ).fetchone()
             assert row["is_ad"] == 0 and row["is_top"] == 0
             assert row["topic_category"] is None
+            # 老行的徽标列取默认值 NULL，不能被填成 0 ——
+            # 0 在抖音语义里是"无徽标"，但老库里我们【根本不知道】，
+            # 用 NULL 表达"未知"才诚实，也让 label_id=9 之类的过滤不会误命中
+            assert row["label_id"] is None
+            assert row["sub_board"] is None
             # 历史行仍在（迁移没有重建表）
             assert repo.conn.execute("SELECT COUNT(*) c FROM snapshot").fetchone()["c"] == 1
         finally:
