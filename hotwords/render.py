@@ -2,10 +2,11 @@
 
 设计：
   - 暗色主题（适配用户 IDE dark theme）
-  - 三个视图：
-      1) 跨源共现榜（横向条形，热度指数）
-      2) 词条排名走势（多轮折线，Top N 词条）
-      3) 源健康度（各源每轮条目数）
+  - 视图：
+      1) 持续霸榜 Top（长期）      2) 新词突现 / 涨跌（此刻）
+      3) 跨源共现榜                4) 位置与性质标记（广告位/置顶/活动话题）
+      5) 排名走势（多轮折线）      6) 突现词轨迹（近 20 轮）
+      7) 源健康度（各源每轮条目数）
   - 纯手写 SVG + 少量原生 JS，不引 CDN（离线可用）
 """
 from __future__ import annotations
@@ -41,7 +42,10 @@ def _q1(v: float) -> str:
     return f"{v:.1f}"
 
 
-def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) -> str:
+def render_dashboard(
+    repo, out_path: str = "dashboard.html", last_n: int = 0,
+    config_path: str | None = None,
+) -> str:
     """生成看板。
 
     last_n <= 0（默认）= 聚合全部轮次。
@@ -140,6 +144,29 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) ->
                       "max_streak": 0, "is_topic": 1})
             marked_data.append(d)
 
+    # ---- 突现 / 涨跌（最新一轮）----
+    # 与持续榜必须共用同一份排除清单：同一个库里两张榜若口径不同，
+    # 用户会以为其中一张算错了。所以这里读 config，而不是自己写死规则。
+    from hotwords.config import load_config
+    from hotwords.emergence import detect_emergence, rank_series
+
+    cfg = load_config(config_path) if config_path else load_config()
+    exclude = cfg.track_excluded()
+    exclude_labels = cfg.track_excluded_labels()
+    emerg = detect_emergence(
+        repo, limit=15, exclude=exclude, exclude_labels=exclude_labels
+    )
+    emergence_data = [e.to_dict() for e in emerg]
+
+    # 突现词的近轮轨迹：只画【有历史的】突现词（全新词没有轨迹可画）。
+    # 这张图回答的是"它是怎么窜上来的"——是断档后 V 型回归，还是一路陡升，
+    # 条形榜里的分数给不出这个信息。
+    track_words = [e.word for e in emerg if not e.is_new][:6]
+    # 默认只取最近 20 轮：轨迹图看的是"最近怎么上来的"，
+    # 把 98 轮全铺上去只会让折线糊成一片。显式传 --last 时按用户的来。
+    life_n = last_n if (last_n and last_n > 0) else 20
+    life_labels, life_series = rank_series(repo, track_words, last_n=life_n)
+
     # ---- 统计卡 ----
     total_rows = len(rows)
     multi = sum(1 for w in words if w.cross_source_count >= 2)
@@ -153,6 +180,10 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) ->
     payload = {
         "cross": [w.to_dict() for w in top_cross],
         "persist": persist_data,
+        "emergence": emergence_data,
+        "lifeLabels": life_labels,
+        "lifeSeries": life_series,
+        "lifeWindow": life_n,
         "marked": marked_data,
         "runLabels": run_labels,
         "timeline": {k: v for k, v in timeline.items()},
@@ -167,6 +198,7 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) ->
             "runs": total_runs,
             "maxStreak": max_streak,
             "ads": ad_words,
+            "emergence": len(emergence_data),
         },
     }
 
@@ -241,6 +273,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding:2px 6px;border-radius:4px;background:#1f6feb33;color:#79c0ff}
   .rank-move{font-size:11px;margin-left:4px}
   .up{color:#3fb950} .down{color:#ff7b72}
+  /* 突现分构成（"新词+35 + 第3名+27"）单独一行：突现榜的说服力全在这行，
+     塞进 tooltip 就等于没展示 */
+  .em-reason{font-size:11px;color:var(--dim);padding-left:250px;margin:-5px 0 8px}
 </style>
 </head>
 <body>
@@ -262,6 +297,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="card" style="grid-column:1/-1">
+    <h2>新词突现 / 涨跌<span>最新一轮相对各词「上次出现」的变化；条形 = 突现分（新词 35 · 回归 20 · 位置 30−名次 · 跃升 0.8×位数 · 跨源 12×源数）</span></h2>
+    <div id="emergence"></div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
     <h2>跨源共现榜<span>热度指数 = 源内分位 × 跨源权重</span></h2>
     <div id="cross"></div>
   </div>
@@ -272,11 +312,16 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>排名走势<span>Top 词条在各轮的最佳名次（y 轴自适应范围）</span></h2>
+    <h2>排名走势<span>跨源 Top 词条在各轮的最佳名次（y 轴自适应范围）</span></h2>
     <div id="trend"></div>
   </div>
 
   <div class="card">
+    <h2>突现词轨迹<span id="lifeWin"></span></h2>
+    <div id="life"></div>
+  </div>
+
+  <div class="card" style="grid-column:1/-1">
     <h2>各源每轮采集量<span>健康度监控</span></h2>
     <div id="health"></div>
   </div>
@@ -293,6 +338,7 @@ document.getElementById('sub').textContent =
 const stats = [
   ['词条去重', D.stats.words],
   ['跨源共现', D.stats.multi],
+  ['本轮突现', D.stats.emergence],
   ['广告位', D.stats.ads],
   ['最长连续', D.stats.maxStreak + '轮'],
   ['数据轮次', D.stats.runs],
@@ -411,6 +457,39 @@ function renderMarked(){
   }).join('');
 }
 
+// 新词突现 / 涨跌：与持续榜互补的一张榜。
+// 持续度对新词天然不利（累加轮数少、覆盖度低），想找"什么正在爆发"
+// 必须换判据 —— 这里的宽度是突现分，不是热度，两者不要横向比较。
+function renderEmergence(){
+  const el = document.getElementById('emergence');
+  let list = (D.emergence || []).slice();
+  if(state.q) list = list.filter(e=>e.word.includes(state.q));
+  if(!list.length){ el.innerHTML='<div class="empty">暂无突现词条</div>'; return; }
+  const max = Math.max(...list.map(e=>e.score)) || 1;
+  el.innerHTML = list.map(e=>{
+    const pct = (e.score/max*100).toFixed(1);
+    // 三色区分"为什么上榜"：橙=全新、紫=断档回归、绿=连续在榜但窜升
+    const color = e.is_new ? '#f0883e' : (e.rounds_absent ? '#d2a8ff' : '#3fb950');
+    let mk = e.is_new ? badge('新词', 'lbl-新')
+           : (e.rounds_absent ? badge('回归', 'lbl-热议') : '');
+    if(e.rank_delta > 0) mk += `<span class="rank-move up">▲${e.rank_delta}</span>`;
+    else if(e.rank_delta < 0) mk += `<span class="rank-move down">▼${-e.rank_delta}</span>`;
+    const tags = e.sources.map(s=>`<span class="tag">${D.sourceNames[s]||s}</span>`).join('');
+    const tip = `第 ${e.rank} 名`
+      + (e.prev_rank!=null ? ` / 上轮第 ${e.prev_rank} 名` : '')
+      + (e.rounds_absent ? ` / 断档 ${e.rounds_absent} 轮后回归` : '')
+      + ` / ${e.source_count} 源`;
+    return `<div class="bar-row">
+        <div class="bar-label" title="${tip}"><span class="w">${e.word}</span>${mk}</div>
+        <div class="tags">${tags}</div>
+        <div class="bar-track" title="${e.reason}">
+          <div class="bar-fill" style="width:${pct}%;background:${color}"></div></div>
+        <div class="bar-val">${e.score.toFixed(1)}</div>
+      </div>
+      <div class="em-reason">${e.reason}</div>`;
+  }).join('');
+}
+
 // 搜索/筛选联动
 ['q','onlyMulti','onlyStreak'].forEach(id=>{
   const el=document.getElementById(id);
@@ -418,19 +497,22 @@ function renderMarked(){
     state.q = document.getElementById('q').value.trim();
     state.onlyMulti = document.getElementById('onlyMulti').checked;
     state.onlyStreak = document.getElementById('onlyStreak').checked;
-    renderPersist(); renderCross(); renderMarked();
+    renderPersist(); renderCross(); renderMarked(); renderEmergence();
   });
 });
 
 renderPersist();
 renderCross();
 renderMarked();
+renderEmergence();
 
-// 排名走势（折线）
-(function(){
-  const el = document.getElementById('trend');
-  const labels = D.runLabels, series = D.trendSeries, words = Object.keys(series);
-  if(!labels.length || !words.length){ el.innerHTML='<div class="empty">需要多轮数据才能显示走势</div>'; return; }
+// 排名折线图（排名走势 / 突现词轨迹 共用）
+// 抽成一个函数而不是复制一份：两处折线的断线语义（None 必须断开）和
+// y 轴自适应逻辑完全一致，复制出去迟早会只改一处。
+function drawRankChart(container, labels, series, emptyMsg){
+  const el = typeof container==='string' ? document.getElementById(container) : container;
+  const words = Object.keys(series || {});
+  if(!labels.length || !words.length){ el.innerHTML=`<div class="empty">${emptyMsg}</div>`; return; }
 
   const W=560,H=260,PL=44,PR=16,PT=16,PB=34;
   const iw=W-PL-PR, ih=H-PT-PB;
@@ -458,7 +540,7 @@ renderMarked();
     if(labels.length>8 && i%2!==0 && i!==labels.length-1) return;
     svg+=`<text class="axis-text" x="${x(i)}" y="${H-PB+18}" text-anchor="middle">${lb.slice(0,5)}</text>`;
   });
-  // 折线
+  // 折线：null 处必须断开（started=false），连成直线会假造出"一直在榜"
   words.forEach((w,wi)=>{
     const c=palette[wi%palette.length];
     let d='', started=false;
@@ -476,6 +558,16 @@ renderMarked();
   const legend = words.map((w,i)=>
     `<span><i style="background:${palette[i%palette.length]}"></i>${w.slice(0,14)}</span>`).join('');
   el.innerHTML = svg + `<div class="legend">${legend}</div>`;
+}
+
+drawRankChart('trend', D.runLabels, D.trendSeries, '需要多轮数据才能显示走势');
+
+// 突现词轨迹：只画有历史的突现词（全新词没有轨迹）
+(function(){
+  const el = document.getElementById('lifeWin');
+  if(el) el.textContent = `近 ${D.lifeWindow} 轮 · 越靠上名次越高（默认只画有历史的突现词）`;
+  drawRankChart('life', D.lifeLabels, D.lifeSeries,
+    '本轮突现全为全新词，暂无可画轨迹');
 })();
 
 // 各源每轮采集量（堆叠柱）
