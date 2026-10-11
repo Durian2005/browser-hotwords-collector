@@ -108,8 +108,8 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) ->
     persist = load_persistence(repo, limit=15, min_streak=1)
     persist_data = [p.to_dict() for p in persist]
 
-    # ---- 位置标记词条（广告位 / 置顶）----
-    # 这两类词条在持续度榜上排名往往靠后（广告位是平台轮播的，streak 短），
+    # ---- 位置 / 性质标记词条（广告位、置顶、活动话题）----
+    # 这些词条在持续度榜上排名往往靠后（广告位是平台轮播的，streak 短），
     # 单看 Top15 会漏掉，所以单列一张表：它们的证据价值在于"性质"而非"热度"。
     marked = repo.conn.execute(
         """SELECT canonical_word, sources, total_rounds, current_streak,
@@ -118,6 +118,27 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) ->
            ORDER BY (is_ad=1) DESC, total_rounds DESC, max_streak DESC LIMIT 30"""
     ).fetchall()
     marked_data = [dict(r) for r in marked]
+
+    # 活动话题（抖音「挑战」）单独从 snapshot 取：它们【已被排除出 word_track】，
+    # 在持续度榜里根本不存在，只能回快照层找。这也正是"只排除统计、不排除采集"
+    # 的价值 —— 统计层干净了，证据层仍然完整。
+    from hotwords.labels import DOUYIN_TOPIC_BADGES
+
+    if DOUYIN_TOPIC_BADGES:
+        ids = ",".join(str(i) for i in sorted(DOUYIN_TOPIC_BADGES))
+        topic_rows = repo.conn.execute(
+            f"""SELECT word AS canonical_word,
+                       GROUP_CONCAT(DISTINCT source) AS sources,
+                       COUNT(DISTINCT run_id) AS total_rounds,
+                       MAX(label) AS label
+                FROM snapshot WHERE label_id IN ({ids})
+                GROUP BY word ORDER BY total_rounds DESC LIMIT 12"""
+        ).fetchall()
+        for r in topic_rows:
+            d = dict(r)
+            d.update({"is_ad": 0, "is_top": 0, "current_streak": 0,
+                      "max_streak": 0, "is_topic": 1})
+            marked_data.append(d)
 
     # ---- 统计卡 ----
     total_rows = len(rows)
@@ -197,6 +218,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   .lbl-沸{background:#5a1a2a;color:#ff9bb0}
   .lbl-辟谣{background:#1a4a3a;color:#7ee2b8}
   .lbl-热议{background:#2a2a4a;color:#b0a8ff}
+  /* 抖音徽标（枚举语义见 labels.py）：挑战是活动话题，配色刻意与真实热点区分 */
+  .lbl-首发{background:#4a2a1a;color:#ffb87b}
+  .lbl-独家{background:#3a1a4a;color:#d0a0ff}
+  .lbl-挑战{background:#1a4a2a;color:#7ee29b}
+  .lbl-剧集{background:#2a3a4a;color:#9fc4e8}
   .cat{display:inline-block;font-size:10px;padding:0 4px;border-radius:3px;
     background:#21262d;color:var(--dim);vertical-align:middle;flex-shrink:0}
   svg{display:block;width:100%;height:auto;overflow:visible}
@@ -231,7 +257,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="grid">
   <div class="card" style="grid-column:1/-1">
-    <h2>持续霸榜 Top<span>跨轮持续性 = 真热度；单轮共现可能是巧合</span></h2>
+    <h2>持续霸榜 Top<span>条形宽度 = 上榜占比（连续轮数并列时靠它区分）；右侧数字为连续轮数</span></h2>
     <div id="persist"></div>
   </div>
 
@@ -241,7 +267,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="card" style="grid-column:1/-1">
-    <h2>位置标记词条<span>广告位 / 置顶，取自平台自身标记，非算法推断</span></h2>
+    <h2>位置与性质标记<span>广告位 / 置顶 / 活动话题，取自平台自身标记，非算法推断</span></h2>
     <div id="marked"></div>
   </div>
 
@@ -286,6 +312,10 @@ function markPersist(p){
   let h='';
   if(p.is_ad)  h += badge('广告', 'lbl-广告');
   if(p.is_top) h += badge('置顶', 'lbl-置顶');
+  // 平台徽标（新/热/首发/独家/剧集/辟谣/热议）：取该词累计出现过的第一个，
+  // 置顶/广告已单独成列，不在这里重复显示
+  const lb = (p.labels||[]).filter(x => x && x !== '置顶' && x !== '广告')[0];
+  if(lb) h += badge(lb, 'lbl-' + lb);
   return h;
 }
 function markCross(w){
@@ -299,23 +329,33 @@ function markCross(w){
 }
 
 // 持续霸榜
+// 条形宽度用【上榜占比】而不是连续轮数，也不是持续度得分。
+// 原因：长跑到近百轮后，榜首十来个词条的连续轮数会全部并列（都是 55 轮），
+// 拿连续轮数当宽度会让它们全是 100% 满格，图表直接失去信息量。
+// 换个轴试过两次：
+//   - 持续度得分：这些词本来就是近乎并列的真平局，得分只差 4%
+//     （56.4 vs 54.0），画出来还是几乎一样宽，等于没修；
+//   - 上榜占比（累计轮数 / 总轮数）：差距 56%~78%，是真实且有意义的区分度
+//     —— "在全部 98 轮里有多少轮在榜"本身就是一个独立的强信号。
+// 于是：宽度 = 上榜占比，右侧数字仍显示连续轮数（排序依据），
+// 其余（累计/最佳/得分）放 tooltip。
 function renderPersist(){
   const el = document.getElementById('persist');
   let list = D.persist.slice();
   if(state.q) list = list.filter(p=>p.word.includes(state.q));
   if(state.onlyStreak) list = list.filter(p=>p.current_streak>=2);
   if(!list.length){ el.innerHTML='<div class="empty">无匹配词条</div>'; return; }
-  const maxStreak = Math.max(...list.map(p=>p.current_streak), 2);
+  const runs = D.stats.runs || Math.max(...list.map(p=>p.total_rounds), 1);
   el.innerHTML = list.map(p=>{
-    const pct=(p.current_streak/maxStreak*100).toFixed(1);
+    const pct=(p.total_rounds/runs*100).toFixed(1);
     const tags=p.sources.map(s=>`<span class="tag">${D.sourceNames[s]||s}</span>`).join('');
     const color = p.current_streak>=3 ? '#3fb950' : (p.current_streak>=2 ? '#d29922' : '#58a6ff');
     return `<div class="bar-row">
       <div class="bar-label" title="${p.word}"><span class="w">${p.word}</span>${markPersist(p)}</div>
       <div class="tags">${tags}</div>
-      <div class="bar-track" title="连续 ${p.current_streak} 轮 / 累计 ${p.total_rounds} 轮 / 最佳第 ${p.best_rank} 名">
+      <div class="bar-track" title="上榜 ${p.total_rounds}/${runs} 轮（占比 ${pct}%）/ 连续 ${p.current_streak} 轮 / 最佳第 ${p.best_rank} 名 / 持续度 ${p.persistence_score}">
         <div class="bar-fill" style="width:${pct}%;background:${color}"></div></div>
-      <div class="bar-val"><span class="streak-badge">${p.current_streak}轮</span></div>
+      <div class="bar-val"><span class="streak-badge" title="连续轮数">${p.current_streak}轮</span></div>
     </div>`;
   }).join('');
 }
@@ -344,7 +384,7 @@ function renderCross(){
   }).join('');
 }
 
-// 位置标记词条（广告位 / 置顶）：证据价值在"性质"而非"热度"
+// 位置与性质标记词条：证据价值在"性质"而非"热度"
 function renderMarked(){
   const el = document.getElementById('marked');
   let list = (D.marked || []).slice();
@@ -353,15 +393,19 @@ function renderMarked(){
   const maxR = Math.max(...list.map(m=>m.total_rounds), 1);
   el.innerHTML = list.map(m=>{
     const mk = (m.is_ad ? badge('广告','lbl-广告') : '')
-             + (m.is_top ? badge('置顶','lbl-置顶') : '');
+             + (m.is_top ? badge('置顶','lbl-置顶') : '')
+             + (m.is_topic ? badge('挑战','lbl-挑战') : '');
     const srcs = (m.sources||'').split(',').filter(Boolean)
       .map(s=>`<span class="tag">${D.sourceNames[s]||s}</span>`).join('');
     const pct = (m.total_rounds/maxR*100).toFixed(1);
+    const tip = `累计上榜 ${m.total_rounds} 轮` + (m.is_topic
+      ? '（活动话题，已排除出持续度统计）'
+      : ` / 最长连续 ${m.max_streak} 轮`);
     return `<div class="bar-row">
       <div class="bar-label" title="${m.canonical_word}"><span class="w">${m.canonical_word}</span>${mk}</div>
       <div class="tags">${srcs}</div>
-      <div class="bar-track" title="累计上榜 ${m.total_rounds} 轮 / 最长连续 ${m.max_streak} 轮">
-        <div class="bar-fill" style="width:${pct}%;background:#f0883e"></div></div>
+      <div class="bar-track" title="${tip}">
+        <div class="bar-fill" style="width:${pct}%;background:${m.is_topic?'#3fb950':'#f0883e'}"></div></div>
       <div class="bar-val">${m.total_rounds}轮</div>
     </div>`;
   }).join('');
