@@ -7,9 +7,10 @@
 ## 0. 一分钟上手
 
 ```bash
-python -m hotwords once     # 采集一轮（约 5 秒）
-python -m hotwords track    # 看持续上榜榜
-python -m hotwords trend    # 生成看板并打开
+python -m hotwords once       # 采集一轮（约 5 秒）
+python -m hotwords track      # 看持续上榜榜（"长期"）
+python -m hotwords emergence  # 看什么词正在爆发（"此刻"）
+python -m hotwords trend      # 生成看板并打开
 ```
 
 Windows 用户可直接双击 `run.bat`，会出现交互菜单（选 1~6）。
@@ -51,13 +52,15 @@ pip install -r requirements.txt
 |---|---|
 | `python -m hotwords sources` | 列出所有源的状态 |
 | `python -m hotwords once` | **跑一轮采集** |
-| `python -m hotwords track` | 持续上榜榜 |
+| `python -m hotwords track` | 持续上榜榜（长期，靠跨轮累加） |
+| `python -m hotwords emergence` | 突现 / 涨跌榜（此刻，只看最新一轮相对上次） |
 | `python -m hotwords cross` | 跨源共现榜 |
 | `python -m hotwords trend` | 生成看板 `dashboard.html` |
 | `python -m hotwords report` | 数据概览 |
 | `python -m hotwords alerts` | 查看告警 |
 | `python -m hotwords run` | 常驻调度 |
-| `python tests/test_basic.py` | 跑测试 |
+| `python -m hotwords retrack` | 从快照重建持续上榜数据（改排除清单后必跑） |
+| `python tests/test_basic.py` | 跑测试（25 项） |
 
 全局参数：`--db <路径>`（默认 `hotwords.db`）、`--config <路径>`、`-v`（详细日志）。
 
@@ -118,7 +121,38 @@ python -m hotwords track --limit 20 --min-streak 2
 | 源数 | 几个平台出现过，≥2 即跨源 |
 | **持续度** | 0~150 综合分 |
 
-### 3.3 看哪些词全网都在聊
+### 3.3 看什么词正在爆发
+
+```bash
+python -m hotwords emergence --limit 20
+```
+
+只看**最新一轮**相对各词**上次出现**的变化，专门找刚冒头的：
+
+```
+词条                        名次    上轮    断档    跃升    源   分       构成
+------------------------------------------------------------------------------------------------
+张雪机车葡萄牙站第二回合              3     —     新     —     1   62.0    新词+35 + 第3名+27
+            ……（中间 17 行同为全新词，略）……
+2026美好奇妙夜节目单              10    22     0    +12    2   41.6    第10名+20 + 升12位+9.6 + 2源+12
+王曼昱横扫佐藤瞳夺冠                2     2     0      0    2   40.0    第2名+28 + 2源+12
+```
+
+| 列 | 含义 |
+|---|---|
+| **名次** | 本轮最好名次（置顶 rank=0 不参与比较） |
+| 上轮 | 上次出现时的名次；`—` = 全新词 |
+| 断档 | 中间缺席几轮；`新` = 从未出现过，`0` = 连续在榜 |
+| 跃升 | 名次变化（`+` 为上升） |
+| **分** | 突现分（新词 35 / 回归 20 / 位置 `30−名次` / 跃升 `0.8×位数` / 跨源 `12×(源数−1)`） |
+| 构成 | 得分的逐项拆解，直接说明"为什么它排在前面" |
+
+**和 `track` 的分工**：`track` 找"长期稳定的真热度"，`emergence` 找"此刻的爆发"。
+持续度对新词天然不利，所以**不要**用 `track` 的下半部分去找新出现的词。
+
+`--min-score X` 可过滤掉低分噪声（例如 `--min-score 30` 只看强信号）。
+
+### 3.4 看哪些词全网都在聊
 
 ```bash
 python -m hotwords cross
@@ -127,17 +161,18 @@ python -m hotwords cross
 单个平台的榜单可能被运营干预，**多平台同时顶上去**说明是真实公共事件。
 热度指数单源满分 100，多源按 `1 + log2(源数)` 加成，所以 **>100 即跨平台**。
 
-### 3.4 看趋势图
+### 3.5 看趋势图
 
 ```bash
 python -m hotwords trend
 ```
 
-生成 `dashboard.html`（自包含、离线可用），含 4 个视图：
-持续霸榜 Top、跨源共现榜、排名走势折线、各源采集量堆叠柱。
+生成 `dashboard.html`（自包含、离线可用），含 7 个视图：
+持续霸榜 Top、新词突现 / 涨跌、跨源共现榜、位置与性质标记、
+排名走势折线、突现词轨迹、各源采集量堆叠柱。
 顶部有搜索框与筛选勾选。
 
-### 3.5 挂机采集
+### 3.6 挂机采集
 
 ```bash
 python -m hotwords run
@@ -225,15 +260,18 @@ def parse_newsite(payload: dict, source: str, category: str) -> ParseResult:
 
 ---
 
-## 6. 三个"热度"视角
+## 6. 四个"热度"视角
 
 | 视角 | 回答什么 | 抗噪性 |
 |---|---|---|
 | 单源排名 | 某平台排第几 | ❌ 各平台各自为政 |
 | 跨源共现 | 多平台是否同时上榜 | ⚠️ 单轮可能是巧合 |
 | **持续上榜** | 是否连续多轮在榜 | ✅ 最强信号 |
+| **突现 / 涨跌** | 此刻是否正在爆发 | ✅ 抢新（看长尾用持续度） |
 
 一个词偶尔上榜可能是巧合，**连续多轮在榜**几乎不可能是噪声。
+反过来，一个词**刚出现就冲到前几名**，也几乎不可能是巧合 ——
+这是两个方向的问题，用两套判据。
 
 ### `persistence_score`（0~150）
 
@@ -243,6 +281,16 @@ def parse_newsite(payload: dict, source: str, category: str) -> ParseResult:
 
 每轮采集后**增量更新**：本轮上榜则 `total_rounds+1`；若上轮也在榜则 `streak+1`；
 本轮未上榜则 `streak` 归零（断档检测）。
+
+### `emergence_score`（0~约 135）
+
+```
+新词 +35 | 断档后回归 +20 | 位置 30−名次（名次<30 才计）
+名次跃升 0.8×位数（上限 30 位） | 跨源 12×(源数−1)
+```
+
+只看**最后一轮**，不做跨轮累加。排除清单与持续榜共用，
+`failed` 轮不参与判定（否则会把采集失败误算成"断档好几天"）。
 
 ---
 
