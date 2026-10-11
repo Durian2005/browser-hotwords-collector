@@ -38,6 +38,14 @@ class HotItem:
     is_ad: bool = False                # 广告/推广位（微博 is_ad / topic_ad）
     is_top: bool = False               # 置顶（百度 isTop、头条 fixed_top_data）
     topic_category: str | None = None  # 内容分类（头条 InterestCategory / 微博 flag_desc）
+    # 徽标的【机器可读枚举】。label 是给人看的中文展示名，可随我们改映射而变；
+    # label_id 是平台给的原始数字，配置要排除某个徽标时按它来，才不会因为
+    # 改了个中文名就让 sources.yaml 里的规则静默失效。中文名见 labels.py。
+    label_id: int | None = None
+    # 所属子榜 id（抖音 word_sub_board）。实测同一词条在 [3] 与 None 之间
+    # 【从不切换】（98 轮 229 个词，0 次），说明它是词条的稳定属性，
+    # 不是动态状态 —— 这正是判定"挑战话题属于独立子榜"的关键旁证。
+    sub_board: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)  # 原始条目
 
     def raw_json(self) -> str:

@@ -6,8 +6,10 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Protocol
 
+from hotwords.labels import douyin_badge
 from hotwords.models import HotItem, ParseResult
 from hotwords.normalize import NORM_VERSION, normalize_hot_value
 
@@ -229,19 +231,21 @@ def parse_weibo(payload: dict, source: str, category: str) -> ParseResult:
 
 # ============================================================
 # 抖音热榜
-# 结构：data.word_list[] -> {word, hot_value, label, ...}
+# 结构：data.word_list[] -> {word, hot_value, label, word_sub_board, ...}
 #
-# ⚠️ label 是【平台内部数字枚举】，官方从未公开语义，实测也无法从内容反推：
-#    label=9（全库 264 条，且恒带 post_aweme_info + word_sub_board=[3]）
-#    的样本是"别睡太晚别爱太满""全员进入不烧心时代"，看着像商业推广位；
-#    label=16 有"北京人社局辟谣社保卡金卡"，像辟谣 —— 但都只是样本印象。
-#    这里【只映射有把握的两个】，其余返回 None，原始数字完整留在 raw 里。
-#    宁可少标，也不能凭猜测定性：猜错会把真实热点标成广告，比不标更糟。
+# ⚠️ label 是【平台内部数字枚举】，官方从未公开语义。
+#    早期实现只映射了有把握的 1->新、3->热，其余宁可留空（当时的立场是
+#    "猜错会把真实热点标成广告，比不标更糟"）。这个立场是对的，
+#    但结论在 2026-10-11 被推翻 —— 因为找到了不需要猜的证据：
+#    每条带 label 的条目都附了徽标图 URL，文件名就是 label 值本身，
+#        .../hotspot_detail_page/<label>.png
+#    下载放大后肉眼确认，8 个值全部可读（见 labels.py 与 README「坑 21」）。
+#    → 现在全量映射，且不再有任何猜测成分。
+#
+# ⚠️ word_sub_board 只出现过 None 与 [3] 两种情况，且 [3] 与 label=9(挑战)
+#    几乎完全重合（745 vs 753 条），同一词条从不在这两者间切换 ——
+#    说明「挑战」是独立子榜，不是主榜条目。是否参与持续度统计交给配置决定。
 # ============================================================
-_DOUYIN_LABEL = {
-    "1": "新",
-    "3": "热",
-}
 
 
 @register("douyin")
@@ -258,6 +262,12 @@ def parse_douyin(payload: dict, source: str, category: str) -> ParseResult:
         if not word:
             continue
         heat = entry.get("hot_value")
+        raw_label = entry.get("label")
+        try:
+            label_id = int(raw_label)
+        except (TypeError, ValueError):
+            label_id = None
+        sub = entry.get("word_sub_board")
         items.append(
             HotItem(
                 source=source,
@@ -267,7 +277,9 @@ def parse_douyin(payload: dict, source: str, category: str) -> ParseResult:
                 hot_value=str(heat) if heat is not None else None,
                 hot_value_num=normalize_hot_value(heat),
                 norm_version=NORM_VERSION,
-                label=_DOUYIN_LABEL.get(str(entry.get("label"))) or None,
+                label=douyin_badge(raw_label),
+                label_id=label_id,
+                sub_board=(json.dumps(sub, separators=(",", ":")) if sub else None),
                 url=f"https://www.douyin.com/search/{word}",
                 raw=entry,
             )

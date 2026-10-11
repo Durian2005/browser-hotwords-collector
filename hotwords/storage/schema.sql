@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS snapshot (
     is_ad         INTEGER NOT NULL DEFAULT 0,  -- 广告/推广位（微博 is_ad / topic_ad）
     is_top        INTEGER NOT NULL DEFAULT 0,  -- 置顶（百度 isTop、头条 fixed_top_data）
     topic_category TEXT,                   -- 内容分类（头条 InterestCategory / 微博 flag_desc）
+    label_id      INTEGER,                 -- 徽标的机器可读枚举（抖音 label；中文名见 labels.py）
+    sub_board     TEXT,                    -- 所属子榜 id（抖音 word_sub_board，如 "[3]"）
     raw           TEXT,                    -- 原始条目 JSON（rescue 用）
     fetched_at    TEXT NOT NULL,           -- ISO8601
     -- ⚠️ 唯一约束必须含 run_id：仅用 fetched_at 做去重时，
@@ -115,6 +117,11 @@ CREATE TABLE IF NOT EXISTS word_track (
     last_rank         INTEGER,                      -- 最近一轮名次（判升/降）
     source_count      INTEGER NOT NULL DEFAULT 1,   -- 出现过的源数
     sources           TEXT,                          -- 逗号分隔
+    -- 累积出现过的【徽标中文名】（并集，不回退），如 "热" / "新,热"。
+    -- 与 sources 同一套累积思路：徽标是平台给的性质，历史出现过就该留痕，
+    -- 否则同一词条在"没被打标"的那一轮会显得从未被标记过，不够诚实。
+    -- 注意中文名可能随 labels.py 的措辞变，机器判据请始终用 snapshot.label_id。
+    labels            TEXT,
     persistence_score REAL NOT NULL DEFAULT 0,      -- 持续度综合分
     -- 标记位：只要该词条在任意一轮被标为广告位/置顶，即置 1（累积 OR，不回退）
     is_ad             INTEGER NOT NULL DEFAULT 0,

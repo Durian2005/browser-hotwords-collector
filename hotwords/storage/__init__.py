@@ -29,10 +29,13 @@ class Repository:
             ("is_ad", "INTEGER NOT NULL DEFAULT 0"),
             ("is_top", "INTEGER NOT NULL DEFAULT 0"),
             ("topic_category", "TEXT"),
+            ("label_id", "INTEGER"),
+            ("sub_board", "TEXT"),
         ],
         "word_track": [
             ("is_ad", "INTEGER NOT NULL DEFAULT 0"),
             ("is_top", "INTEGER NOT NULL DEFAULT 0"),
+            ("labels", "TEXT"),
         ],
     }
 
@@ -102,9 +105,11 @@ class Repository:
                 it.norm_version,
                 it.label,
                 it.url,
-                int(it.is_ad),
+                it.is_ad,
                 int(it.is_top),
                 it.topic_category,
+                it.label_id,
+                it.sub_board,
                 it.raw_json(),
                 fetched_at,
             )
@@ -114,8 +119,8 @@ class Repository:
             """INSERT OR IGNORE INTO snapshot
                (run_id, source, category, rank, word, hot_value, hot_value_num,
                 norm_version, label, url, is_ad, is_top, topic_category,
-                raw, fetched_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                label_id, sub_board, raw, fetched_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             rows,
         )
         self.conn.commit()
