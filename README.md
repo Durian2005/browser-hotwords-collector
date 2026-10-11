@@ -39,9 +39,9 @@ python tests/test_basic.py    # 25/25 通过
 `cross` / `trend` 支持 `--last N` 只看最近 N 轮（默认 `0` = 全部）。
 `emergence` 支持 `--limit N`（默认 30）与 `--min-score X` 过滤低分噪声。
 
-Windows 下双击 `run.bat` 会出现交互菜单（选 1~6），
-也支持 `run.bat once / track / cross / trend / report / retrack / test`。
-选 6 挂机会同时把日志追加写入 `logs/scheduler.log`，便于次日回溯。
+Windows 下双击 `run.bat` 会出现交互菜单（选 1~7），
+也支持 `run.bat once / track / emergence / cross / trend / report / retrack / run / test`。
+选 7 挂机会同时把日志追加写入 `logs/scheduler.log`，便于次日回溯。
 
 `run.bat` 按以下优先级挑解释器
 （挑错会报 `ModuleNotFoundError: No module named 'yaml'`）：

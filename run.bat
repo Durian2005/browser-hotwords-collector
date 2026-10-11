@@ -5,11 +5,12 @@ REM  browser-hotwords-collector - launcher (Windows)
 REM
 REM  Double-click        = show menu
 REM  run.bat 1           = collect one round
-REM  run.bat 2           = persistence ranking
-REM  run.bat 3           = cross-source ranking
-REM  run.bat 4           = build + open dashboard
-REM  run.bat 5           = overview + alerts
-REM  run.bat 6           = scheduler (keep running)
+REM  run.bat 2           = persistence ranking (long term)
+REM  run.bat 3           = emergence ranking   (breaking now)
+REM  run.bat 4           = cross-source ranking
+REM  run.bat 5           = build + open dashboard
+REM  run.bat 6           = overview + alerts
+REM  run.bat 7           = scheduler (keep running)
 REM  run.bat test        = run tests
 REM
 REM  Python interpreter (priority order):
@@ -31,10 +32,12 @@ cd /d %~dp0
 if "%~1"==""       goto menu
 if "%~1"=="1"      goto once
 if "%~1"=="2"      goto track
-if "%~1"=="3"      goto cross
-if "%~1"=="4"      goto trend
-if "%~1"=="5"      goto report
-if "%~1"=="6"      goto run
+if "%~1"=="3"      goto emergence
+if "%~1"=="4"      goto cross
+if "%~1"=="5"      goto trend
+if "%~1"=="6"      goto report
+if "%~1"=="7"      goto run
+if "%~1"=="emergence" goto emergence
 if "%~1"=="run"    goto run
 if "%~1"=="test"   goto test
 if "%~1"=="report" goto report
@@ -50,20 +53,22 @@ echo.
 echo    ==========  HOTWORDS  ==========
 echo.
 echo      [1]  Collect one round        (~5s)
-echo      [2]  Persistence ranking      (real heat)
-echo      [3]  Cross-source ranking     (multi-platform)
-echo      [4]  Trend dashboard          (open in browser)
-echo      [5]  Overview + alerts        (health check)
-echo      [6]  Run scheduler            (Ctrl+C to stop)
+echo      [2]  Persistence ranking      (long term)
+echo      [3]  Emergence ranking        (breaking now)
+echo      [4]  Cross-source ranking     (multi-platform)
+echo      [5]  Trend dashboard          (open in browser)
+echo      [6]  Overview + alerts        (health check)
+echo      [7]  Run scheduler            (Ctrl+C to stop)
 echo      [0]  Exit
 echo.
 set /p CH=  Input number then Enter:
 if "%CH%"=="1" goto once
 if "%CH%"=="2" goto track
-if "%CH%"=="3" goto cross
-if "%CH%"=="4" goto trend
-if "%CH%"=="5" goto report
-if "%CH%"=="6" goto run
+if "%CH%"=="3" goto emergence
+if "%CH%"=="4" goto cross
+if "%CH%"=="5" goto trend
+if "%CH%"=="6" goto report
+if "%CH%"=="7" goto run
 if "%CH%"=="0" goto end
 echo   Invalid choice.
 pause
@@ -77,6 +82,11 @@ goto done
 :track
 echo.
 "%PY%" -m hotwords track --limit 20
+goto done
+
+:emergence
+echo.
+"%PY%" -m hotwords emergence --limit 20
 goto done
 
 :cross
@@ -136,6 +146,7 @@ goto end
 echo.
 echo   run.bat          collect one round
 echo   run.bat track    persistence ranking
+echo   run.bat emergence   emergence ranking
 echo   run.bat cross    cross-source ranking
 echo   run.bat trend    build and open dashboard
 echo   run.bat report   overview + alerts

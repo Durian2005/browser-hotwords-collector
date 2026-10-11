@@ -13,7 +13,7 @@ python -m hotwords emergence  # 看什么词正在爆发（"此刻"）
 python -m hotwords trend      # 生成看板并打开
 ```
 
-Windows 用户可直接双击 `run.bat`，会出现交互菜单（选 1~6）。
+Windows 用户可直接双击 `run.bat`，会出现交互菜单（选 1~7）。
 
 ---
 
@@ -69,12 +69,15 @@ pip install -r requirements.txt
 ```bat
 run.bat            :: 跑一轮
 run.bat 2          :: 持续上榜榜
-run.bat 3          :: 跨源共现榜
-run.bat 4          :: 生成并打开看板
-run.bat 5          :: 概览 + 告警
-run.bat 6          :: 常驻调度
+run.bat 3          :: 突现 / 涨跌榜
+run.bat 4          :: 跨源共现榜
+run.bat 5          :: 生成并打开看板
+run.bat 6          :: 概览 + 告警
+run.bat 7          :: 常驻调度
 run.bat test       :: 跑测试
 ```
+
+也支持关键字写法：`run.bat once / track / emergence / cross / trend / report / retrack / run / test`。
 
 ---
 
