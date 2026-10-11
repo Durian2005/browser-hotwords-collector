@@ -180,6 +180,206 @@ def test_track_persistence_streak():
             repo.close()
 
 
+def test_weibo_ad_flag():
+    """微博广告位：is_ad/topic_ad 归一到 is_ad，flag_desc 作为内容分类。"""
+    payload = {"data": {"realtime": [
+        {"word": "品牌代言人", "num": 100, "is_ad": 1, "topic_ad": 1, "flag_desc": "综艺"},
+        {"word": "正常热搜", "num": 200, "label_name": "热"},
+    ]}}
+    r = get_parser("weibo")(payload, "weibo_hot", "main")
+    assert r.items[0].is_ad is True
+    assert r.items[0].topic_category == "综艺"
+    assert r.items[1].is_ad is False
+    assert r.items[1].label == "热"
+
+
+def test_douyin_label_map():
+    """抖音 label 是内部数字枚举：只映射有把握的，未确认的一律 None（不猜）。"""
+    payload = {"data": {"word_list": [
+        {"word": "甲", "hot_value": 1, "label": 1},
+        {"word": "乙", "hot_value": 2, "label": 3},
+        {"word": "丙", "hot_value": 3, "label": 9},
+    ]}}
+    r = get_parser("douyin")(payload, "douyin_hot", "main")
+    assert r.items[0].label == "新"
+    assert r.items[1].label == "热"
+    assert r.items[2].label is None
+
+
+def test_toutiao_marks_and_category():
+    """头条：置顶标记、LabelDesc 优先、InterestCategory 映射中文。"""
+    payload = {
+        "fixed_top_data": {"Title": "置顶", "InterestCategory": ["finance"]},
+        "data": [
+            {"Title": "新闻", "HotValue": "1", "Label": "refuteRumors",
+             "LabelDesc": "辟谣", "InterestCategory": ["taiwan"]},
+        ],
+    }
+    r = get_parser("toutiao")(payload, "toutiao_hot", "main")
+    assert r.items[0].is_top is True
+    assert r.items[0].topic_category == "财经"
+    assert r.items[1].label == "辟谣"            # LabelDesc 优先于英文枚举
+    assert r.items[1].topic_category == "中国台湾"
+
+
+def test_baidu_marks():
+    """百度：isTop 落到 is_top，标签取 newHotName（Category 实测恒空，不可用）。"""
+    payload = {"data": {"cards": [{"content": [{"content": [
+        {"isTop": True, "word": "置顶词", "index": 0},
+        {"index": 1, "word": "普通词", "newHotName": "热", "Category": ""},
+    ]}]}]}}
+    r = get_parser("baidu")(payload, "baidu_hot", "realtime")
+    assert r.items[0].is_top is True
+    assert r.items[1].is_top is False
+    assert r.items[1].label == "热"
+
+
+def test_snapshot_marks_roundtrip():
+    """标记字段落库后可读回。"""
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.storage import Repository
+    from hotwords.models import HotItem, ParseResult
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            rid = repo.start_run()
+            items = [HotItem(source="weibo_hot", category="main", rank=1, word="广告词",
+                             is_ad=True, topic_category="综艺")]
+            repo.save_snapshot(rid, ParseResult("weibo_hot", "main", items, {"word"}))
+            row = repo.conn.execute(
+                "SELECT is_ad, is_top, topic_category FROM snapshot"
+            ).fetchone()
+            assert row["is_ad"] == 1
+            assert row["is_top"] == 0
+            assert row["topic_category"] == "综艺"
+        finally:
+            repo.close()
+
+
+def test_legacy_db_migration():
+    """老库（无标记列）打开后自动补列，历史行取默认值。
+
+    这是本次改动最危险的回归点：`CREATE TABLE IF NOT EXISTS` 不会给已存在的表
+    补列，若不迁移，线上那个 1.2 万条快照的库会在 INSERT 时直接报
+    "no such column: is_ad"。
+    """
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.storage import Repository
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        p = Path(td) / "legacy.db"
+        con = sqlite3.connect(str(p))
+        con.executescript("""
+            CREATE TABLE snapshot (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL, source TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'main',
+                rank INTEGER NOT NULL, word TEXT NOT NULL, hot_value TEXT,
+                hot_value_num INTEGER, norm_version TEXT, label TEXT, url TEXT,
+                raw TEXT, fetched_at TEXT NOT NULL);
+            CREATE TABLE word_track (
+                word_hash TEXT PRIMARY KEY, canonical_word TEXT NOT NULL,
+                first_seen_run TEXT NOT NULL, last_seen_run TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                total_rounds INTEGER NOT NULL DEFAULT 1,
+                current_streak INTEGER NOT NULL DEFAULT 1,
+                max_streak INTEGER NOT NULL DEFAULT 1,
+                best_rank INTEGER NOT NULL DEFAULT 999, last_rank INTEGER,
+                source_count INTEGER NOT NULL DEFAULT 1, sources TEXT,
+                persistence_score REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+            INSERT INTO snapshot(run_id,source,category,rank,word,fetched_at)
+                VALUES('r1','baidu_hot','realtime',1,'历史词','2026-01-01T00:00:00');
+            INSERT INTO word_track(word_hash,canonical_word,first_seen_run,last_seen_run,
+                first_seen_at,last_seen_at,updated_at)
+                VALUES('h1','历史词','r1','r1','2026-01-01T00:00:00','2026-01-01T00:00:00',
+                       '2026-01-01T00:00:00');
+        """)
+        con.commit()
+        con.close()
+
+        repo = Repository(p)
+        try:
+            cols = {r["name"] for r in repo.conn.execute("PRAGMA table_info(snapshot)")}
+            assert {"is_ad", "is_top", "topic_category"} <= cols
+            wt = {r["name"] for r in repo.conn.execute("PRAGMA table_info(word_track)")}
+            assert {"is_ad", "is_top"} <= wt
+            row = repo.conn.execute(
+                "SELECT is_ad, is_top, topic_category FROM snapshot"
+            ).fetchone()
+            assert row["is_ad"] == 0 and row["is_top"] == 0
+            assert row["topic_category"] is None
+            # 历史行仍在（迁移没有重建表）
+            assert repo.conn.execute("SELECT COUNT(*) c FROM snapshot").fetchone()["c"] == 1
+        finally:
+            repo.close()
+
+
+def test_drift_ignores_optional_fields():
+    """可选字段时有时无不应报漂移；关键字段缺失才报。
+
+    坑 4 的回归测试：早期实现比较"字段集合是否完全相等"，
+    而微博 is_ad(2.5%) / icon*(56%) 这类可选字段会让每轮都报漂移。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.storage import Repository
+    from hotwords.models import HotItem, ParseResult
+
+    def mk(fields):
+        items = [HotItem(source="weibo_hot", category="main", rank=1, word="词")]
+        return ParseResult("weibo_hot", "main", items, set(fields))
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            # 第 1 轮：字段多（含可选字段）
+            assert repo.check_drift(
+                mk({"word", "num", "is_ad", "icon"}), must_have={"word"}
+            ) is None
+            # 第 2 轮：可选字段消失 —— 关键字段 word 仍在，不应报
+            assert repo.check_drift(mk({"word", "num"}), must_have={"word"}) is None
+            # 第 3 轮：关键字段 word 消失 -> 必须报
+            p = repo.check_drift(mk({"num", "is_ad"}), must_have={"word"})
+            assert p and "关键字段缺失" in p
+        finally:
+            repo.close()
+
+
+def test_drift_any_of_and_bulk_change():
+    """多选一字段（百度 word/title）与"字段大面积换血"兜底。"""
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.storage import Repository
+    from hotwords.models import HotItem, ParseResult
+
+    def mk(fields):
+        items = [HotItem(source="baidu_hot", category="realtime", rank=1, word="词")]
+        return ParseResult("baidu_hot", "realtime", items, set(fields))
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            # 只有 title（垂直榜情形）-> any_of 满足，不报
+            assert repo.check_drift(mk({"title", "url"}), any_of={"word", "title"}) is None
+            # word 与 title 都没有 -> 报
+            p = repo.check_drift(mk({"foo", "bar"}), any_of={"word", "title"})
+            assert p and "候选关键字段全部缺失" in p
+            # 旧字段几乎全消失（>50%）-> 兜底报
+            repo.check_drift(mk({"a", "b", "c", "d", "word"}), any_of={"word", "title"})
+            p2 = repo.check_drift(mk({"x", "y", "word"}), any_of={"word", "title"})
+            assert p2 and "大面积变化" in p2
+        finally:
+            repo.close()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
