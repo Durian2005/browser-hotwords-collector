@@ -119,7 +119,9 @@ class Pipeline:
             from hotwords.analysis import track_persistence
 
             try:
-                n = track_persistence(self.repo, run_id)
+                n = track_persistence(
+                    self.repo, run_id, exclude=self.cfg.track_excluded()
+                )
                 logger.info("持续上榜追踪更新: %d 个词条", n)
             except Exception as e:  # 追踪失败不能影响采集主流程
                 logger.warning("持续上榜追踪失败: %s", e)

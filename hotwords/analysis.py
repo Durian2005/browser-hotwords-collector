@@ -20,9 +20,13 @@
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -163,7 +167,11 @@ def load_recent_snapshot(repo, run_id: str | None = None) -> list[dict]:
 
 
 def load_snapshot_over_runs(repo, last_n: int = 10) -> list[dict]:
-    """跨多轮聚合：用于"持续上榜"分析（比单轮更稳）。"""
+    """跨多轮聚合：用于"持续上榜"分析（比单轮更稳）。
+
+    last_n <= 0 表示【全部轮次】（长跑之后默认只看最近 N 轮会漏掉大量词条，
+    导致看板"累计词条"数远小于实际，容易误读）。
+    """
     run_ids = _recent_run_ids(repo, last_n)
     if not run_ids:
         return []
@@ -177,23 +185,27 @@ def load_snapshot_over_runs(repo, last_n: int = 10) -> list[dict]:
 
 
 def _recent_run_ids(repo, last_n: int) -> list[str]:
-    """按插入顺序（rowid）取最近 N 轮 run_id。
+    """按插入顺序（rowid）取最近 N 轮 run_id；last_n <= 0 取全部。
 
     不用 started_at：同一秒内跑多轮时时间戳退化，排序不确定。
     """
-    return [
-        r["run_id"]
-        for r in repo.conn.execute(
-            "SELECT run_id FROM run WHERE status IN ('ok','partial') "
-            "ORDER BY rowid DESC LIMIT ?",
-            (last_n,),
-        ).fetchall()
-    ]
+    sql = ("SELECT run_id FROM run WHERE status IN ('ok','partial') "
+           "ORDER BY rowid DESC")
+    params: tuple = ()
+    if last_n and last_n > 0:
+        sql += " LIMIT ?"
+        params = (last_n,)
+    return [r["run_id"] for r in repo.conn.execute(sql, params).fetchall()]
 
 
 # ============================================================
 # 持续上榜分析（V3 主线）
 # ============================================================
+# 断档阈值：相邻两轮的间隔超过该值即视为"中断"，streak 不再延续。
+# 没有它，跨天（停一晚再挂）会被误算成"连续"，streak 一路虚高，
+# "连续 N 轮"就失去意义 —— 实测踩到：隔 19 小时仍被判为相邻轮。
+# 挂机整轮默认 10 分钟，3 小时容差足以覆盖重启/短暂中断，又能在跨天时正确断开。
+MAX_GAP_MINUTES = 180
 # 核心问题：单轮"跨源共现"有偶发噪声 —— 某词刚好两源同时出现，未必是真热点。
 # 真正稳定的信号是"跨轮持续性"：
 #     连续 N 轮都在榜  >>  只出现 1 轮
@@ -269,10 +281,49 @@ def compute_persistence_score(
     )
 
 
-def track_persistence(repo, run_id: str, total_runs: int | None = None) -> int:
+def _exclude_clause(exclude: set[tuple[str, str]] | None) -> tuple[str, list]:
+    """把 {(source, category)} 排除集合编译成 SQL 片段。
+
+    返回 (sql_fragment, params)。用于过滤【运营推广位】——
+    如百度 movie/novel/teleplay 榜，其 #1 在 39/39 轮里纹丝不动，
+    并非搜索热度，必须排除在持续上榜统计之外（详见 sources.yaml 注释）。
+    """
+    if not exclude:
+        return "", []
+    ors, params = [], []
+    for src, cat in sorted(exclude):
+        ors.append("(source=? AND category=?)")
+        params.extend([src, cat])
+    return " AND NOT (" + " OR ".join(ors) + ")", params
+
+
+def _gap_minutes(prev_finished: str | None, cur_started: str | None) -> float | None:
+    """两个 ISO 时间戳之间的分钟数；任一缺失或无法解析则返回 None。"""
+    if not prev_finished or not cur_started:
+        return None
+    try:
+        a = datetime.fromisoformat(prev_finished)
+        b = datetime.fromisoformat(cur_started)
+    except (ValueError, TypeError):
+        return None
+    return (b - a).total_seconds() / 60.0
+
+
+def track_persistence(
+    repo,
+    run_id: str,
+    total_runs: int | None = None,
+    max_gap_minutes: int = MAX_GAP_MINUTES,
+    exclude: set[tuple[str, str]] | None = None,
+) -> int:
     """增量更新 word_track。返回本轮涉及词条数。
 
     在每轮采集完成后调用（pipeline.run_once 末尾）。
+
+    max_gap_minutes: 与上一轮的间隔超过该值即视为断档（streak 重置），
+                     避免跨天的两段挂机被误算成"连续"。
+    exclude:         {(source, category)} 黑名单，这些榜单不参与统计
+                     （运营推广位）。数据仍保留在 snapshot 里。
     """
     import hashlib
     from hotwords.models import utcnow_iso
@@ -280,12 +331,13 @@ def track_persistence(repo, run_id: str, total_runs: int | None = None) -> int:
 
     now = utcnow_iso()
 
-    # 本轮各词条的最佳名次 + 来源（跳过置顶 rank=0）
+    # 本轮各词条的最佳名次 + 来源（跳过置顶 rank=0；并剔除运营位）
+    where, params = _exclude_clause(exclude)
     rows = repo.conn.execute(
-        """SELECT word, MIN(CASE WHEN rank>0 THEN rank END) AS best_rank,
+        f"""SELECT word, MIN(CASE WHEN rank>0 THEN rank END) AS best_rank,
                   GROUP_CONCAT(DISTINCT source) AS srcs
-           FROM snapshot WHERE run_id=? GROUP BY word""",
-        (run_id,),
+           FROM snapshot WHERE run_id=?{where} GROUP BY word""",
+        (run_id, *params),
     ).fetchall()
 
     if total_runs is None:
@@ -296,13 +348,30 @@ def track_persistence(repo, run_id: str, total_runs: int | None = None) -> int:
     # 上一轮：用 rowid 判定插入顺序，不依赖 started_at
     # （同一秒内跑多轮时 started_at 会退化，导致 prev_run 选错，实测踩到）
     prev_row = repo.conn.execute(
-        """SELECT r.run_id FROM run r
+        """SELECT r.run_id, r.finished_at FROM run r
            WHERE r.status IN ('ok','partial')
              AND r.rowid < (SELECT rowid FROM run WHERE run_id = ?)
            ORDER BY r.rowid DESC LIMIT 1""",
         (run_id,),
     ).fetchone()
-    prev_run = prev_row["run_id"] if prev_row else None
+
+    prev_run = None
+    if prev_row:
+        cur_row = repo.conn.execute(
+            "SELECT started_at FROM run WHERE run_id=?", (run_id,)
+        ).fetchone()
+        gap = _gap_minutes(
+            prev_row["finished_at"], cur_row["started_at"] if cur_row else None
+        )
+        # gap 为 None（时间戳缺失/无法解析）时按"中断"处理：
+        # 宁可重置 streak，也不让缺失的时间戳撑出虚高的连续记录。
+        if gap is not None and gap <= max_gap_minutes:
+            prev_run = prev_row["run_id"]
+        else:
+            logger.debug(
+                "距上一轮 %s 分钟（阈值 %d），视为断档，streak 重置",
+                f"{gap:.1f}" if gap is not None else "未知", max_gap_minutes,
+            )
 
     touched = 0
     seen_hashes: set[str] = set()
@@ -373,6 +442,39 @@ def track_persistence(repo, run_id: str, total_runs: int | None = None) -> int:
         )
 
     repo.conn.commit()
+    return touched
+
+
+def rebuild_track(
+    repo,
+    max_gap_minutes: int = MAX_GAP_MINUTES,
+    exclude: set[tuple[str, str]] | None = None,
+) -> int:
+    """从 snapshot 全量重放，重建 word_track。
+
+    用途：
+      - 修正历史脏数据（早期版本没有断档检测，跨天会被算成"连续"）
+      - 调整算法或权重之后重算
+      - 调整运营位排除清单之后重算（exclude 参数）
+    返回末轮涉及的词条数。
+    """
+    repo.conn.execute("DELETE FROM word_track")
+    repo.conn.commit()
+
+    run_ids = [
+        r["run_id"]
+        for r in repo.conn.execute(
+            "SELECT run_id FROM run WHERE status IN ('ok','partial') ORDER BY rowid"
+        ).fetchall()
+    ]
+    total = len(run_ids)
+    touched = 0
+    for rid in run_ids:
+        touched = track_persistence(
+            repo, rid, total_runs=max(total, 1),
+            max_gap_minutes=max_gap_minutes, exclude=exclude,
+        )
+    logger.info("word_track 已从 %d 轮快照重建，末轮涉及 %d 个词条", total, touched)
     return touched
 
 

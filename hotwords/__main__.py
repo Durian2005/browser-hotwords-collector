@@ -19,11 +19,19 @@ from hotwords.storage import Repository
 LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s | %(message)s"
 
 
-def _setup_logging(verbose: bool) -> None:
+def _setup_logging(verbose: bool, log_file: str | None = None) -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        from pathlib import Path
+
+        p = Path(log_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(p, encoding="utf-8"))
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format=LOG_FMT,
         datefmt="%H:%M:%S",
+        handlers=handlers,
     )
 
 
@@ -102,6 +110,25 @@ def cmd_track(args) -> int:
     return 0
 
 
+def cmd_retrack(args) -> int:
+    from hotwords.analysis import rebuild_track
+
+    repo = Repository(args.db)
+    cfg = load_config(args.config) if args.config else load_config()
+    n = rebuild_track(
+        repo, max_gap_minutes=args.max_gap, exclude=cfg.track_excluded()
+    )
+    runs = repo.conn.execute(
+        "SELECT COUNT(*) c FROM run WHERE status IN ('ok','partial')"
+    ).fetchone()["c"]
+    excl = cfg.track_excluded()
+    if excl:
+        listed = ", ".join(f"{s}/{c}" for s, c in sorted(excl))
+        print(f"（已排除运营位: {listed}）")
+    print(f"已从 {runs} 轮快照重建持续上榜数据，末轮涉及 {n} 个词条。")
+    return 0
+
+
 def cmd_cross(args) -> int:
     from hotwords.analysis import compute_cross_source, load_snapshot_over_runs
 
@@ -134,7 +161,7 @@ def cmd_trend(args) -> int:
 def cmd_run(args) -> int:
     from hotwords.scheduler import run_forever
 
-    run_forever(args.db, once=False)
+    run_forever(args.db, once=False, interval_min=args.interval)
     return 0
 
 
@@ -143,11 +170,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--db", default="hotwords.db", help="SQLite 路径")
     p.add_argument("--config", default=None, help="源配置路径")
+    p.add_argument("--log-file", default=None, help="同时把日志追加写入该文件")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("run", help="常驻调度").set_defaults(func=cmd_run)
     sub.add_parser("once", help="跑一轮").set_defaults(func=cmd_once)
     sub.add_parser("sources", help="列出源").set_defaults(func=cmd_sources)
+
+    pr = sub.add_parser("run", help="常驻调度（整轮全量）")
+    pr.add_argument("--interval", type=int, default=None,
+                    help="整轮间隔分钟（默认取各启用源的最大值，即不加速任何源）")
+    pr.set_defaults(func=cmd_run)
 
     pa = sub.add_parser("alerts", help="查看告警")
     pa.add_argument("--limit", type=int, default=20)
@@ -157,7 +189,8 @@ def main(argv: list[str] | None = None) -> int:
 
     pc = sub.add_parser("cross", help="跨源共现榜")
     pc.add_argument("--limit", type=int, default=30)
-    pc.add_argument("--last", type=int, default=10, help="聚合最近 N 轮")
+    pc.add_argument("--last", type=int, default=0,
+                    help="聚合最近 N 轮；0（默认）= 全部轮次")
     pc.set_defaults(func=cmd_cross)
 
     pk = sub.add_parser("track", help="持续上榜榜")
@@ -165,13 +198,19 @@ def main(argv: list[str] | None = None) -> int:
     pk.add_argument("--min-streak", type=int, default=1, dest="min_streak")
     pk.set_defaults(func=cmd_track)
 
+    pb = sub.add_parser("retrack", help="从快照全量重建持续上榜数据")
+    pb.add_argument("--max-gap", type=int, default=180, dest="max_gap",
+                    help="断档阈值（分钟）：相邻两轮间隔超过该值即视为中断")
+    pb.set_defaults(func=cmd_retrack)
+
     pt = sub.add_parser("trend", help="生成趋势可视化 HTML")
     pt.add_argument("--out", default="dashboard.html")
-    pt.add_argument("--last", type=int, default=20, help="聚合最近 N 轮")
+    pt.add_argument("--last", type=int, default=0,
+                    help="聚合最近 N 轮；0（默认）= 全部轮次")
     pt.set_defaults(func=cmd_trend)
 
     args = p.parse_args(argv)
-    _setup_logging(args.verbose)
+    _setup_logging(args.verbose, args.log_file)
     return args.func(args)
 
 

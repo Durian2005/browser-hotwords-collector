@@ -41,7 +41,13 @@ def _q1(v: float) -> str:
     return f"{v:.1f}"
 
 
-def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 20) -> str:
+def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) -> str:
+    """生成看板。
+
+    last_n <= 0（默认）= 聚合全部轮次。
+    早期默认只看最近 20 轮，长跑后看板顶部的"累计词条"远小于实际
+    （实测 42 轮的库显示 531，而全库是 932），容易误读。
+    """
     rows = load_snapshot_over_runs(repo, last_n)
 
     # ---- 跨源共现榜 ----
@@ -49,10 +55,13 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 20) -
     top_cross = words[:15]
 
     # ---- 逐轮趋势 ----
+    # last_n <= 0 时取全部轮次；否则只取最近 N 轮
+    _limit_sql = "LIMIT ?" if (last_n and last_n > 0) else ""
+    _limit_p = (last_n,) if (last_n and last_n > 0) else ()
     runs = repo.conn.execute(
         "SELECT run_id, started_at, status FROM run WHERE status IN ('ok','partial') "
-        "ORDER BY started_at ASC LIMIT ?",
-        (last_n,),
+        f"ORDER BY started_at ASC {_limit_sql}",
+        _limit_p,
     ).fetchall()
     run_labels = [r["started_at"][11:19] for r in runs]
     run_ids = [r["run_id"] for r in runs]
