@@ -253,6 +253,7 @@ class TrackRow:
     last_seen_at: str
     is_ad: bool = False
     is_top: bool = False
+    labels: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -267,6 +268,7 @@ class TrackRow:
             "persistence_score": round(self.persistence_score, 2),
             "is_ad": self.is_ad,
             "is_top": self.is_top,
+            "labels": self.labels,
         }
 
 
@@ -305,19 +307,29 @@ def compute_persistence_score(
     )
 
 
-def _exclude_clause(exclude: set[tuple[str, str]] | None) -> tuple[str, list]:
-    """把 {(source, category)} 排除集合编译成 SQL 片段。
+def _exclude_clause(
+    exclude: set[tuple[str, str]] | None,
+    exclude_labels: set[tuple[str, int]] | None = None,
+) -> tuple[str, list]:
+    """把排除规则编译成 SQL 片段。返回 (sql_fragment, params)。
 
-    返回 (sql_fragment, params)。用于过滤【运营推广位】——
-    如百度 movie/novel/teleplay 榜，其 #1 在 39/39 轮里纹丝不动，
-    并非搜索热度，必须排除在持续上榜统计之外（详见 sources.yaml 注释）。
+    两类规则，粒度不同，得分开表达：
+      - exclude        {(source, category)}：整张榜都排除。
+        用于百度 movie/novel/teleplay 这类【推广位榜单】—— 其 #1 在 39/39
+        轮里纹丝不动，整张榜都不构成搜索热度。
+      - exclude_labels {(source, label_id)}：只排除带该徽标的【条目】。
+        用于抖音「挑战」话题 —— 活动话题和真实热搜混在同一张榜里，
+        整榜排除会把真热点一起扔掉，所以只能按条目排。
     """
-    if not exclude:
-        return "", []
     ors, params = [], []
-    for src, cat in sorted(exclude):
+    for src, cat in sorted(exclude or ()):
         ors.append("(source=? AND category=?)")
         params.extend([src, cat])
+    for src, lab in sorted(exclude_labels or ()):
+        ors.append("(source=? AND label_id=?)")
+        params.extend([src, lab])
+    if not ors:
+        return "", []
     return " AND NOT (" + " OR ".join(ors) + ")", params
 
 
@@ -339,6 +351,7 @@ def track_persistence(
     total_runs: int | None = None,
     max_gap_minutes: int = MAX_GAP_MINUTES,
     exclude: set[tuple[str, str]] | None = None,
+    exclude_labels: set[tuple[str, int]] | None = None,
 ) -> int:
     """增量更新 word_track。返回本轮涉及词条数。
 
@@ -348,6 +361,8 @@ def track_persistence(
                      避免跨天的两段挂机被误算成"连续"。
     exclude:         {(source, category)} 黑名单，这些榜单不参与统计
                      （运营推广位）。数据仍保留在 snapshot 里。
+    exclude_labels:  {(source, label_id)} 黑名单，带这些徽标的条目不参与统计
+                     （抖音「挑战」活动话题）。同样是"只排除统计、不排除采集"。
     """
     import hashlib
     from hotwords.models import utcnow_iso
@@ -355,11 +370,12 @@ def track_persistence(
 
     now = utcnow_iso()
 
-    # 本轮各词条的最佳名次 + 来源（跳过置顶 rank=0；并剔除运营位）
-    where, params = _exclude_clause(exclude)
+    # 本轮各词条的最佳名次 + 来源（跳过置顶 rank=0；并剔除运营位/活动话题）
+    where, params = _exclude_clause(exclude, exclude_labels)
     rows = repo.conn.execute(
         f"""SELECT word, MIN(CASE WHEN rank>0 THEN rank END) AS best_rank,
                   GROUP_CONCAT(DISTINCT source) AS srcs,
+                  GROUP_CONCAT(DISTINCT label) AS labs,
                   MAX(is_ad) AS is_ad, MAX(is_top) AS is_top
            FROM snapshot WHERE run_id=?{where} GROUP BY word""",
         (run_id, *params),
@@ -414,6 +430,7 @@ def track_persistence(
         best_rank = int(r["best_rank"]) if r["best_rank"] is not None else 999
         # 注意：必须先做 set 差集再 sorted，否则 list - set 会 TypeError
         srcs = sorted({s for s in (r["srcs"] or "").split(",") if s})
+        labs = sorted({x for x in (r["labs"] or "").split(",") if x})
         new_ad = int(r["is_ad"] or 0)
         new_top = int(r["is_top"] or 0)
 
@@ -427,11 +444,11 @@ def track_persistence(
                    (word_hash, canonical_word, first_seen_run, last_seen_run,
                     first_seen_at, last_seen_at, total_rounds, current_streak,
                     max_streak, best_rank, last_rank, source_count, sources,
-                    persistence_score, is_ad, is_top, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    labels, persistence_score, is_ad, is_top, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (word_hash, word, run_id, run_id, now, now,
                  1, 1, 1, best_rank, best_rank, len(srcs) or 1,
-                 ",".join(srcs), 0.0, new_ad, new_top, now),
+                 ",".join(srcs), ",".join(labs) or None, 0.0, new_ad, new_top, now),
             )
         else:
             # streak 判断：上一轮（prev_run）是否也在榜 → 连续 +1，否则重置为 1
@@ -440,6 +457,7 @@ def track_persistence(
             total_rounds = cur["total_rounds"] + 1
             max_streak = max(cur["max_streak"], streak)
             all_srcs = sorted({s for s in (cur["sources"] or "").split(",") if s} | set(srcs))
+            all_labs = sorted({x for x in (cur["labels"] or "").split(",") if x} | set(labs))
             best = min(cur["best_rank"], best_rank)
             score = compute_persistence_score(
                 total_rounds, streak, max_streak, best, len(all_srcs) or 1, total_runs
@@ -449,11 +467,12 @@ def track_persistence(
             repo.conn.execute(
                 """UPDATE word_track SET last_seen_run=?, last_seen_at=?, total_rounds=?,
                    current_streak=?, max_streak=?, best_rank=?, last_rank=?,
-                   source_count=?, sources=?, persistence_score=?,
+                   source_count=?, sources=?, labels=?, persistence_score=?,
                    is_ad=?, is_top=?, updated_at=?
                    WHERE word_hash=?""",
                 (run_id, now, total_rounds, streak, max_streak, best, best_rank,
-                 len(all_srcs) or 1, ",".join(all_srcs), score,
+                 len(all_srcs) or 1, ",".join(all_srcs),
+                 ",".join(all_labs) or None, score,
                  int(bool(cur["is_ad"]) or bool(new_ad)),
                  int(bool(cur["is_top"]) or bool(new_top)),
                  now, word_hash),
@@ -482,13 +501,14 @@ def rebuild_track(
     repo,
     max_gap_minutes: int = MAX_GAP_MINUTES,
     exclude: set[tuple[str, str]] | None = None,
+    exclude_labels: set[tuple[str, int]] | None = None,
 ) -> int:
     """从 snapshot 全量重放，重建 word_track。
 
     用途：
       - 修正历史脏数据（早期版本没有断档检测，跨天会被算成"连续"）
       - 调整算法或权重之后重算
-      - 调整运营位排除清单之后重算（exclude 参数）
+      - 调整运营位 / 活动话题排除清单之后重算（exclude / exclude_labels）
     返回末轮涉及的词条数。
     """
     repo.conn.execute("DELETE FROM word_track")
@@ -505,7 +525,8 @@ def rebuild_track(
     for rid in run_ids:
         touched = track_persistence(
             repo, rid, total_runs=max(total, 1),
-            max_gap_minutes=max_gap_minutes, exclude=exclude,
+            max_gap_minutes=max_gap_minutes,
+            exclude=exclude, exclude_labels=exclude_labels,
         )
     logger.info("word_track 已从 %d 轮快照重建，末轮涉及 %d 个词条", total, touched)
     return touched
@@ -514,8 +535,8 @@ def rebuild_track(
 def load_persistence(repo, limit: int = 30, min_streak: int = 1) -> list[TrackRow]:
     """读取持续上榜榜（按持续度排序）。"""
     q = """SELECT canonical_word, word_hash, total_rounds, current_streak, max_streak,
-                  best_rank, last_rank, source_count, sources, persistence_score,
-                  first_seen_at, last_seen_at, is_ad, is_top
+                  best_rank, last_rank, source_count, sources, labels,
+                  persistence_score, first_seen_at, last_seen_at, is_ad, is_top
            FROM word_track WHERE current_streak >= ? OR max_streak >= ?
            ORDER BY current_streak DESC, persistence_score DESC LIMIT ?"""
     rows = repo.conn.execute(q, (min_streak, min_streak, limit)).fetchall()
@@ -537,6 +558,7 @@ def load_persistence(repo, limit: int = 30, min_streak: int = 1) -> list[TrackRo
                 last_seen_at=r["last_seen_at"],
                 is_ad=bool(r["is_ad"]),
                 is_top=bool(r["is_top"]),
+                labels=(r["labels"] or "").split(",") if r["labels"] else [],
             )
         )
     return out

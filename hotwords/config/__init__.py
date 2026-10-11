@@ -48,6 +48,19 @@ class SourceConfig:
     # 若不排除，这些"钉子"会因持续度算法里的「连续轮数」「最佳名次」两项
     # 天然拿满分，直接霸占持续上榜榜的前十几位，把真实跨源热点挤出榜单。
     track_exclude: tuple[str, ...] = ()
+    # 不参与「持续上榜」统计的徽标（按 label_id，抖音专有）。
+    #
+    # 与 track_exclude 的分工：那个是【榜单级】（整张 tab 都排除），
+    # 这个是【条目级】—— 同一个榜单里，带某个徽标的条目单独排除。
+    #
+    # 为什么需要：抖音「挑战」话题（label=9）与 word_sub_board=[3] 绑定，
+    # 是平台官方活动话题，实测会连续 66~79 轮驻留在榜上不动；
+    # 百度垂类榜那种"整榜排除"用不上（挑战条目和真实热搜混在同一张榜里），
+    # 所以必须支持条目级。
+    #
+    # 按数字 id 而不是中文名来配：中文名是我们自己定的映射，
+    # 哪天改个措辞就会让这里的规则静默失效。id 是平台给的，稳定。
+    track_exclude_labels: tuple[int, ...] = ()
 
     @property
     def tabs(self) -> list[str]:
@@ -74,6 +87,17 @@ class AppConfig:
                 out.add((s.id, tab))
         return out
 
+    def track_excluded_labels(self) -> set[tuple[str, int]]:
+        """返回 {(source_id, label_id)} 集合：这些徽标的条目不参与持续上榜统计。
+
+        条目级排除（榜单级见 track_excluded）。
+        """
+        out: set[tuple[str, int]] = set()
+        for s in self.sources:
+            for lab in s.track_exclude_labels:
+                out.add((s.id, int(lab)))
+        return out
+
 
 def load_config(path: str | Path = CONFIG_PATH) -> AppConfig:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
@@ -93,6 +117,9 @@ def load_config(path: str | Path = CONFIG_PATH) -> AppConfig:
                 robots_checked=s.get("robots_checked"),
                 robots_note=s.get("robots_note"),
                 track_exclude=tuple(s.get("track_exclude") or ()),
+                track_exclude_labels=tuple(
+                    int(x) for x in (s.get("track_exclude_labels") or ())
+                ),
             )
         )
     return AppConfig(defaults=raw.get("defaults", {}), sources=sources)

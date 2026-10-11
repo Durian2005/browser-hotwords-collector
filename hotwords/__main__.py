@@ -125,11 +125,14 @@ def cmd_track(args) -> int:
 
 def cmd_retrack(args) -> int:
     from hotwords.analysis import rebuild_track
+    from hotwords.labels import describe_douyin_label
 
     repo = Repository(args.db)
     cfg = load_config(args.config) if args.config else load_config()
     n = rebuild_track(
-        repo, max_gap_minutes=args.max_gap, exclude=cfg.track_excluded()
+        repo, max_gap_minutes=args.max_gap,
+        exclude=cfg.track_excluded(),
+        exclude_labels=cfg.track_excluded_labels(),
     )
     runs = repo.conn.execute(
         "SELECT COUNT(*) c FROM run WHERE status IN ('ok','partial')"
@@ -137,7 +140,14 @@ def cmd_retrack(args) -> int:
     excl = cfg.track_excluded()
     if excl:
         listed = ", ".join(f"{s}/{c}" for s, c in sorted(excl))
-        print(f"（已排除运营位: {listed}）")
+        print(f"（已排除运营位榜单: {listed}）")
+    excl_lab = cfg.track_excluded_labels()
+    if excl_lab:
+        # 回显时把数字 id 翻译成中文徽标，否则用户得回去翻 labels.py
+        listed = ", ".join(
+            f"{s}[{describe_douyin_label(lab)}]" for s, lab in sorted(excl_lab)
+        )
+        print(f"（已排除活动话题徽标: {listed}）")
     print(f"已从 {runs} 轮快照重建持续上榜数据，末轮涉及 {n} 个词条。")
     return 0
 
