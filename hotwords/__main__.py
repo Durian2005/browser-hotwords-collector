@@ -1,11 +1,15 @@
 """CLI 入口：python -m hotwords {run,once,report,sources,alerts}
 
 用法：
-  python -m hotwords run       # 启动常驻调度（APScheduler）
-  python -m hotwords once      # 只跑一轮（推荐先跑这个验证）
-  python -m hotwords sources   # 列出已配置的源
-  python -m hotwords alerts    # 查看最近告警
-  python -m hotwords report    # 查看最近快照概览
+  python -m hotwords run        # 启动常驻调度（APScheduler）
+  python -m hotwords once       # 只跑一轮（推荐先跑这个验证）
+  python -m hotwords sources    # 列出已配置的源
+  python -m hotwords alerts     # 查看最近告警
+  python -m hotwords report     # 查看最近快照概览
+  python -m hotwords track      # 持续上榜榜（长期，靠跨轮累加）
+  python -m hotwords emergence  # 突现 / 涨跌榜（此刻，只看最新一轮相对上次）
+  python -m hotwords cross      # 跨源共现榜
+  python -m hotwords trend      # 生成看板 HTML
 """
 from __future__ import annotations
 
@@ -123,9 +127,30 @@ def cmd_track(args) -> int:
     return 0
 
 
+def _echo_excludes(cfg) -> None:
+    """回显统计口径的排除项（运营位榜单 + 活动话题徽标）。
+
+    凡是"参与统计"的命令（retrack / emergence）都必须走这一个函数。
+    否则两个榜单会各自打印一份口径，措辞稍有出入用户就会怀疑
+    "同一个库为什么两处排除的东西不一样"，而实际只是没人把口径说清。
+    徽标回显时把数字 id 翻成中文，不然用户得回去翻 labels.py。
+    """
+    from hotwords.labels import describe_douyin_label
+
+    excl = cfg.track_excluded()
+    if excl:
+        listed = ", ".join(f"{s}/{c}" for s, c in sorted(excl))
+        print(f"（已排除运营位榜单: {listed}）")
+    excl_lab = cfg.track_excluded_labels()
+    if excl_lab:
+        listed = ", ".join(
+            f"{s}[{describe_douyin_label(lab)}]" for s, lab in sorted(excl_lab)
+        )
+        print(f"（已排除活动话题徽标: {listed}）")
+
+
 def cmd_retrack(args) -> int:
     from hotwords.analysis import rebuild_track
-    from hotwords.labels import describe_douyin_label
 
     repo = Repository(args.db)
     cfg = load_config(args.config) if args.config else load_config()
@@ -137,18 +162,41 @@ def cmd_retrack(args) -> int:
     runs = repo.conn.execute(
         "SELECT COUNT(*) c FROM run WHERE status IN ('ok','partial')"
     ).fetchone()["c"]
-    excl = cfg.track_excluded()
-    if excl:
-        listed = ", ".join(f"{s}/{c}" for s, c in sorted(excl))
-        print(f"（已排除运营位榜单: {listed}）")
-    excl_lab = cfg.track_excluded_labels()
-    if excl_lab:
-        # 回显时把数字 id 翻译成中文徽标，否则用户得回去翻 labels.py
-        listed = ", ".join(
-            f"{s}[{describe_douyin_label(lab)}]" for s, lab in sorted(excl_lab)
-        )
-        print(f"（已排除活动话题徽标: {listed}）")
+    _echo_excludes(cfg)
     print(f"已从 {runs} 轮快照重建持续上榜数据，末轮涉及 {n} 个词条。")
+    return 0
+
+
+def cmd_emergence(args) -> int:
+    from hotwords.emergence import detect_emergence
+
+    repo = Repository(args.db)
+    cfg = load_config(args.config) if args.config else load_config()
+    rows = detect_emergence(
+        repo, limit=args.limit, min_score=args.min_score,
+        exclude=cfg.track_excluded(),
+        exclude_labels=cfg.track_excluded_labels(),
+    )
+    if not rows:
+        print("暂无突现数据，先跑几轮：python -m hotwords once")
+        return 1
+    total_runs = repo.conn.execute(
+        "SELECT COUNT(*) c FROM run WHERE status IN ('ok','partial')"
+    ).fetchone()["c"]
+    print(f"共 {total_runs} 轮数据，下面是最新一轮相对各词上次出现的突现 / 涨跌：\n")
+    _echo_excludes(cfg)
+    print()
+    print(f"{'词条':<26}{'名次':<6}{'上轮':<6}{'断档':<6}{'跃升':<6}{'源':<4}{'分':<8}构成")
+    print("-" * 96)
+    for e in rows:
+        # 全新词：没有"上轮"，也没有"断档"轮数，用「新」把两种情况一次说清，
+        # 比留空更容易一眼扫出来（这是突现榜最想让人看到的那一类）。
+        prev = "—" if e.prev_rank is None else str(e.prev_rank)
+        absent = "新" if e.rounds_absent is None else str(e.rounds_absent)
+        delta = "—" if e.rank_delta is None else (
+            f"+{e.rank_delta}" if e.rank_delta > 0 else str(e.rank_delta))
+        print(f"{e.word[:24]:<26}{e.best_rank:<6}{prev:<6}{absent:<6}"
+              f"{delta:<6}{len(e.sources):<4}{e.score:<8.1f}{e.reason}")
     return 0
 
 
@@ -176,7 +224,8 @@ def cmd_trend(args) -> int:
     from hotwords.render import render_dashboard
 
     repo = Repository(args.db)
-    out = render_dashboard(repo, args.out, last_n=args.last)
+    # 传 config：看板里的突现榜要与 CLI 的 emergence 用同一份排除清单
+    out = render_dashboard(repo, args.out, last_n=args.last, config_path=args.config)
     print(f"已生成: {out}")
     return 0
 
@@ -225,6 +274,12 @@ def main(argv: list[str] | None = None) -> int:
     pb.add_argument("--max-gap", type=int, default=180, dest="max_gap",
                     help="断档阈值（分钟）：相邻两轮间隔超过该值即视为中断")
     pb.set_defaults(func=cmd_retrack)
+
+    pe = sub.add_parser("emergence", help="突现 / 涨跌榜（最新一轮）")
+    pe.add_argument("--limit", type=int, default=30)
+    pe.add_argument("--min-score", type=float, default=0.0, dest="min_score",
+                    help="只显示突现分 ≥ 该值的词条")
+    pe.set_defaults(func=cmd_emergence)
 
     pt = sub.add_parser("trend", help="生成趋势可视化 HTML")
     pt.add_argument("--out", default="dashboard.html")
