@@ -108,6 +108,17 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) ->
     persist = load_persistence(repo, limit=15, min_streak=1)
     persist_data = [p.to_dict() for p in persist]
 
+    # ---- 位置标记词条（广告位 / 置顶）----
+    # 这两类词条在持续度榜上排名往往靠后（广告位是平台轮播的，streak 短），
+    # 单看 Top15 会漏掉，所以单列一张表：它们的证据价值在于"性质"而非"热度"。
+    marked = repo.conn.execute(
+        """SELECT canonical_word, sources, total_rounds, current_streak,
+                  max_streak, is_ad, is_top
+           FROM word_track WHERE is_ad=1 OR is_top=1
+           ORDER BY (is_ad=1) DESC, total_rounds DESC, max_streak DESC LIMIT 30"""
+    ).fetchall()
+    marked_data = [dict(r) for r in marked]
+
     # ---- 统计卡 ----
     total_rows = len(rows)
     multi = sum(1 for w in words if w.cross_source_count >= 2)
@@ -116,10 +127,12 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) ->
         "SELECT COUNT(*) c FROM run WHERE status IN ('ok','partial')"
     ).fetchone()["c"]
     max_streak = max((p.current_streak for p in persist), default=0)
+    ad_words = sum(1 for w in words if w.is_ad)
 
     payload = {
         "cross": [w.to_dict() for w in top_cross],
         "persist": persist_data,
+        "marked": marked_data,
         "runLabels": run_labels,
         "timeline": {k: v for k, v in timeline.items()},
         "trendSeries": trend_series,
@@ -132,6 +145,7 @@ def render_dashboard(repo, out_path: str = "dashboard.html", last_n: int = 0) ->
             "rows": total_rows,
             "runs": total_runs,
             "maxStreak": max_streak,
+            "ads": ad_words,
         },
     }
 
@@ -166,17 +180,25 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   .card h2{font-size:15px;font-weight:600;margin-bottom:14px;color:var(--text)}
   .card h2 span{color:var(--dim);font-weight:400;font-size:12px;margin-left:6px}
   .bar-row{display:flex;align-items:center;gap:10px;margin-bottom:9px}
-  .bar-label{width:200px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
+  .bar-label{width:240px;font-size:13px;display:flex;align-items:center;gap:4px;flex-shrink:0;min-width:0}
+  .bar-label .w{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
   .bar-track{flex:1;background:#21262d;border-radius:4px;height:20px;position:relative;min-width:60px}
   .bar-fill{height:100%;border-radius:4px;transition:width .6s ease}
   .bar-val{width:64px;text-align:right;font-size:12px;color:var(--dim);flex-shrink:0}
   .tags{display:flex;gap:4px;width:56px;flex-shrink:0}
   .tag{font-size:10px;padding:1px 5px;border-radius:3px;background:#21262d;color:var(--dim)}
-  .lbl{display:inline-block;font-size:10px;padding:0 4px;border-radius:3px;margin-left:5px;vertical-align:middle}
+  .lbl{display:inline-block;font-size:10px;padding:0 4px;border-radius:3px;
+    background:#21262d;color:var(--dim);vertical-align:middle;flex-shrink:0}
   .lbl-置顶{background:#5a3a1a;color:#f0b86e}
+  .lbl-广告{background:#5a2a1a;color:#ffa657}
   .lbl-热{background:#5a1a1a;color:#ff7b72}
   .lbl-新{background:#1a3a5a;color:#79c0ff}
   .lbl-爆{background:#5a1a3a;color:#ff7bd0}
+  .lbl-沸{background:#5a1a2a;color:#ff9bb0}
+  .lbl-辟谣{background:#1a4a3a;color:#7ee2b8}
+  .lbl-热议{background:#2a2a4a;color:#b0a8ff}
+  .cat{display:inline-block;font-size:10px;padding:0 4px;border-radius:3px;
+    background:#21262d;color:var(--dim);vertical-align:middle;flex-shrink:0}
   svg{display:block;width:100%;height:auto;overflow:visible}
   .axis{stroke:#30363d;stroke-width:1}
   .axis-text{fill:var(--dim);font-size:11px}
@@ -218,6 +240,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="cross"></div>
   </div>
 
+  <div class="card" style="grid-column:1/-1">
+    <h2>位置标记词条<span>广告位 / 置顶，取自平台自身标记，非算法推断</span></h2>
+    <div id="marked"></div>
+  </div>
+
   <div class="card">
     <h2>排名走势<span>Top 词条在各轮的最佳名次（y 轴自适应范围）</span></h2>
     <div id="trend"></div>
@@ -240,6 +267,7 @@ document.getElementById('sub').textContent =
 const stats = [
   ['词条去重', D.stats.words],
   ['跨源共现', D.stats.multi],
+  ['广告位', D.stats.ads],
   ['最长连续', D.stats.maxStreak + '轮'],
   ['数据轮次', D.stats.runs],
   ['活跃源', D.stats.sources],
@@ -249,6 +277,26 @@ document.getElementById('stats').innerHTML = stats.map(([k,v]) =>
 
 // —— 检索状态 ——
 const state = { q:'', onlyMulti:false, onlyStreak:false };
+
+// —— 标记徽章 ——
+// 广告位 / 置顶是"结构性事实"（库里独立成列），平台标签与内容分类是"展示文案"。
+// 前者用高饱和底色突出，后者用低对比度，避免抢主线信息的注意力。
+function badge(t, cls){ return `<span class="lbl ${cls}">${t}</span>`; }
+function markPersist(p){
+  let h='';
+  if(p.is_ad)  h += badge('广告', 'lbl-广告');
+  if(p.is_top) h += badge('置顶', 'lbl-置顶');
+  return h;
+}
+function markCross(w){
+  let h='';
+  if(w.is_ad) h += badge('广告', 'lbl-广告');
+  const lb = (w.labels||[]).filter(x => x && x !== '置顶')[0];
+  if(lb) h += badge(lb, 'lbl-' + lb);
+  const tc = (w.topic_categories||[])[0];
+  if(tc) h += `<span class="cat">${tc}</span>`;
+  return h;
+}
 
 // 持续霸榜
 function renderPersist(){
@@ -263,7 +311,7 @@ function renderPersist(){
     const tags=p.sources.map(s=>`<span class="tag">${D.sourceNames[s]||s}</span>`).join('');
     const color = p.current_streak>=3 ? '#3fb950' : (p.current_streak>=2 ? '#d29922' : '#58a6ff');
     return `<div class="bar-row">
-      <div class="bar-label" title="${p.word}">${p.word}</div>
+      <div class="bar-label" title="${p.word}"><span class="w">${p.word}</span>${markPersist(p)}</div>
       <div class="tags">${tags}</div>
       <div class="bar-track" title="连续 ${p.current_streak} 轮 / 累计 ${p.total_rounds} 轮 / 最佳第 ${p.best_rank} 名">
         <div class="bar-fill" style="width:${pct}%;background:${color}"></div></div>
@@ -285,11 +333,36 @@ function renderCross(){
     const color = w.cross_source_count>=2 ? '#3fb950' : '#58a6ff';
     const tags = w.sources.map(s=>
       `<span class="tag" title="${s}">${D.sourceNames[s]||s}</span>`).join('');
+    const tip = [w.word, (w.labels||[]).join('/'), (w.topic_categories||[]).join('/')]
+      .filter(Boolean).join(' · ');
     return `<div class="bar-row">
-      <div class="bar-label" title="${w.word}">${w.word}</div>
+      <div class="bar-label" title="${tip}"><span class="w">${w.word}</span>${markCross(w)}</div>
       <div class="tags">${tags}</div>
       <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${color}"></div></div>
       <div class="bar-val">${w.heat_index.toFixed(1)}</div>
+    </div>`;
+  }).join('');
+}
+
+// 位置标记词条（广告位 / 置顶）：证据价值在"性质"而非"热度"
+function renderMarked(){
+  const el = document.getElementById('marked');
+  let list = (D.marked || []).slice();
+  if(state.q) list = list.filter(m=>m.canonical_word.includes(state.q));
+  if(!list.length){ el.innerHTML='<div class="empty">未发现被平台标记的词条</div>'; return; }
+  const maxR = Math.max(...list.map(m=>m.total_rounds), 1);
+  el.innerHTML = list.map(m=>{
+    const mk = (m.is_ad ? badge('广告','lbl-广告') : '')
+             + (m.is_top ? badge('置顶','lbl-置顶') : '');
+    const srcs = (m.sources||'').split(',').filter(Boolean)
+      .map(s=>`<span class="tag">${D.sourceNames[s]||s}</span>`).join('');
+    const pct = (m.total_rounds/maxR*100).toFixed(1);
+    return `<div class="bar-row">
+      <div class="bar-label" title="${m.canonical_word}"><span class="w">${m.canonical_word}</span>${mk}</div>
+      <div class="tags">${srcs}</div>
+      <div class="bar-track" title="累计上榜 ${m.total_rounds} 轮 / 最长连续 ${m.max_streak} 轮">
+        <div class="bar-fill" style="width:${pct}%;background:#f0883e"></div></div>
+      <div class="bar-val">${m.total_rounds}轮</div>
     </div>`;
   }).join('');
 }
@@ -301,12 +374,13 @@ function renderCross(){
     state.q = document.getElementById('q').value.trim();
     state.onlyMulti = document.getElementById('onlyMulti').checked;
     state.onlyStreak = document.getElementById('onlyStreak').checked;
-    renderPersist(); renderCross();
+    renderPersist(); renderCross(); renderMarked();
   });
 });
 
 renderPersist();
 renderCross();
+renderMarked();
 
 // 排名走势（折线）
 (function(){

@@ -27,8 +27,17 @@ class HotItem:
     hot_value: str | None = None       # 热度原始值（保留字符串！）
     hot_value_num: int | None = None   # 归一化数值
     norm_version: str | None = None    # 归一化规则版本
-    label: str | None = None           # 热/沸/新/爆
+    label: str | None = None           # 平台展示标签：热/沸/新/爆/置顶/辟谣…
     url: str | None = None
+    # ---- 位置与性质标记 ----
+    # 为什么不塞进 label：
+    #   label 是"平台给的展示文案"，运营可以随时改（实测头条同一个语义
+    #   在 Label 里是英文枚举、在 LabelDesc 里是中文），拿它做判断会被牵着走；
+    #   而"这条是广告位""这条是置顶"是结构性事实，单列后可直接用 SQL
+    #   过滤/统计（例如数某源每轮有多少广告位），不必回头解析 raw JSON。
+    is_ad: bool = False                # 广告/推广位（微博 is_ad / topic_ad）
+    is_top: bool = False               # 置顶（百度 isTop、头条 fixed_top_data）
+    topic_category: str | None = None  # 内容分类（头条 InterestCategory / 微博 flag_desc）
     raw: dict[str, Any] = field(default_factory=dict)  # 原始条目
 
     def raw_json(self) -> str:

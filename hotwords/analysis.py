@@ -47,6 +47,10 @@ class CrossSourceWord:
     cross_source_count: int = 0
     heat_index: float = 0.0
     best_rank: int = 999
+    # 位置/性质标记（累积：任一源、任一轮被标记即置位）
+    is_ad: bool = False
+    labels: list[str] = field(default_factory=list)            # 平台展示标签
+    topic_categories: list[str] = field(default_factory=list)  # 内容分类
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -55,6 +59,9 @@ class CrossSourceWord:
             "cross_source_count": self.cross_source_count,
             "heat_index": round(self.heat_index, 2),
             "best_rank": self.best_rank,
+            "is_ad": self.is_ad,
+            "labels": self.labels,
+            "topic_categories": self.topic_categories,
             "hits": [
                 {
                     "source": h.source,
@@ -114,6 +121,16 @@ def compute_cross_source(rows: list[dict]) -> list[CrossSourceWord]:
             bucket = CrossSourceWord(word=word, word_hash=hashlib.sha1(key.encode()).hexdigest())
             buckets[bucket_key] = bucket
 
+        # 标记累积：这些字段不参与打分，只用于看板标注（广告位/标签/分类）
+        if r.get("is_ad"):
+            bucket.is_ad = True
+        lb = r.get("label")
+        if lb and lb not in bucket.labels:
+            bucket.labels.append(lb)
+        tc = r.get("topic_category")
+        if tc and tc not in bucket.topic_categories:
+            bucket.topic_categories.append(tc)
+
         src_key = f"{r['source']}/{r.get('category', 'main')}"
         hit = SourceHit(
             source=r["source"],
@@ -160,7 +177,9 @@ def load_recent_snapshot(repo, run_id: str | None = None) -> list[dict]:
             return []
         run_id = row["run_id"]
     cur = repo.conn.execute(
-        "SELECT source, category, rank, word, hot_value_num FROM snapshot WHERE run_id=?",
+        "SELECT source, category, rank, word, hot_value_num, label, "
+        "       is_ad, is_top, topic_category "
+        "FROM snapshot WHERE run_id=?",
         (run_id,),
     )
     return [dict(r) for r in cur.fetchall()]
@@ -177,8 +196,9 @@ def load_snapshot_over_runs(repo, last_n: int = 10) -> list[dict]:
         return []
     marks = ",".join("?" * len(run_ids))
     cur = repo.conn.execute(
-        f"SELECT run_id, source, category, rank, word, hot_value_num FROM snapshot "
-        f"WHERE run_id IN ({marks})",
+        f"SELECT run_id, source, category, rank, word, hot_value_num, label, "
+        f"       is_ad, is_top, topic_category "
+        f"FROM snapshot WHERE run_id IN ({marks})",
         run_ids,
     )
     return [dict(r) for r in cur.fetchall()]
@@ -231,6 +251,8 @@ class TrackRow:
     persistence_score: float
     first_seen_at: str
     last_seen_at: str
+    is_ad: bool = False
+    is_top: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -243,6 +265,8 @@ class TrackRow:
             "source_count": self.source_count,
             "sources": self.sources,
             "persistence_score": round(self.persistence_score, 2),
+            "is_ad": self.is_ad,
+            "is_top": self.is_top,
         }
 
 
@@ -335,7 +359,8 @@ def track_persistence(
     where, params = _exclude_clause(exclude)
     rows = repo.conn.execute(
         f"""SELECT word, MIN(CASE WHEN rank>0 THEN rank END) AS best_rank,
-                  GROUP_CONCAT(DISTINCT source) AS srcs
+                  GROUP_CONCAT(DISTINCT source) AS srcs,
+                  MAX(is_ad) AS is_ad, MAX(is_top) AS is_top
            FROM snapshot WHERE run_id=?{where} GROUP BY word""",
         (run_id, *params),
     ).fetchall()
@@ -389,6 +414,8 @@ def track_persistence(
         best_rank = int(r["best_rank"]) if r["best_rank"] is not None else 999
         # 注意：必须先做 set 差集再 sorted，否则 list - set 会 TypeError
         srcs = sorted({s for s in (r["srcs"] or "").split(",") if s})
+        new_ad = int(r["is_ad"] or 0)
+        new_top = int(r["is_top"] or 0)
 
         cur = repo.conn.execute(
             "SELECT * FROM word_track WHERE word_hash=?", (word_hash,)
@@ -400,11 +427,11 @@ def track_persistence(
                    (word_hash, canonical_word, first_seen_run, last_seen_run,
                     first_seen_at, last_seen_at, total_rounds, current_streak,
                     max_streak, best_rank, last_rank, source_count, sources,
-                    persistence_score, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    persistence_score, is_ad, is_top, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (word_hash, word, run_id, run_id, now, now,
                  1, 1, 1, best_rank, best_rank, len(srcs) or 1,
-                 ",".join(srcs), 0.0, now),
+                 ",".join(srcs), 0.0, new_ad, new_top, now),
             )
         else:
             # streak 判断：上一轮（prev_run）是否也在榜 → 连续 +1，否则重置为 1
@@ -417,13 +444,19 @@ def track_persistence(
             score = compute_persistence_score(
                 total_rounds, streak, max_streak, best, len(all_srcs) or 1, total_runs
             )
+            # 标记只累积不回退：一旦被标为广告位/置顶就永久保留，
+            # 否则同一词条在标记消失的那一轮会"洗白"，历史就不诚实了。
             repo.conn.execute(
                 """UPDATE word_track SET last_seen_run=?, last_seen_at=?, total_rounds=?,
                    current_streak=?, max_streak=?, best_rank=?, last_rank=?,
-                   source_count=?, sources=?, persistence_score=?, updated_at=?
+                   source_count=?, sources=?, persistence_score=?,
+                   is_ad=?, is_top=?, updated_at=?
                    WHERE word_hash=?""",
                 (run_id, now, total_rounds, streak, max_streak, best, best_rank,
-                 len(all_srcs) or 1, ",".join(all_srcs), score, now, word_hash),
+                 len(all_srcs) or 1, ",".join(all_srcs), score,
+                 int(bool(cur["is_ad"]) or bool(new_ad)),
+                 int(bool(cur["is_top"]) or bool(new_top)),
+                 now, word_hash),
             )
         touched += 1
 
@@ -482,7 +515,7 @@ def load_persistence(repo, limit: int = 30, min_streak: int = 1) -> list[TrackRo
     """读取持续上榜榜（按持续度排序）。"""
     q = """SELECT canonical_word, word_hash, total_rounds, current_streak, max_streak,
                   best_rank, last_rank, source_count, sources, persistence_score,
-                  first_seen_at, last_seen_at
+                  first_seen_at, last_seen_at, is_ad, is_top
            FROM word_track WHERE current_streak >= ? OR max_streak >= ?
            ORDER BY current_streak DESC, persistence_score DESC LIMIT ?"""
     rows = repo.conn.execute(q, (min_streak, min_streak, limit)).fetchall()
@@ -502,6 +535,8 @@ def load_persistence(repo, limit: int = 30, min_streak: int = 1) -> list[TrackRo
                 persistence_score=r["persistence_score"],
                 first_seen_at=r["first_seen_at"],
                 last_seen_at=r["last_seen_at"],
+                is_ad=bool(r["is_ad"]),
+                is_top=bool(r["is_top"]),
             )
         )
     return out

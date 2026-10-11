@@ -35,8 +35,12 @@ CREATE TABLE IF NOT EXISTS snapshot (
     hot_value     TEXT,                    -- 热度原始值，如 "1.2亿" / "100909"
     hot_value_num INTEGER,                 -- 归一化数值，可为 NULL
     norm_version  TEXT,                    -- 归一化规则版本，如 "v1"
-    label         TEXT,                    -- 热/沸/新/爆（微博、抖音常见）
+    label         TEXT,                    -- 平台展示标签：热/沸/新/爆/辟谣…
     url           TEXT,                    -- 跳转链接
+    -- 位置与性质标记（独立成列，便于直接 SQL 过滤/统计，不必解析 raw）
+    is_ad         INTEGER NOT NULL DEFAULT 0,  -- 广告/推广位（微博 is_ad / topic_ad）
+    is_top        INTEGER NOT NULL DEFAULT 0,  -- 置顶（百度 isTop、头条 fixed_top_data）
+    topic_category TEXT,                   -- 内容分类（头条 InterestCategory / 微博 flag_desc）
     raw           TEXT,                    -- 原始条目 JSON（rescue 用）
     fetched_at    TEXT NOT NULL,           -- ISO8601
     -- ⚠️ 唯一约束必须含 run_id：仅用 fetched_at 做去重时，
@@ -112,6 +116,9 @@ CREATE TABLE IF NOT EXISTS word_track (
     source_count      INTEGER NOT NULL DEFAULT 1,   -- 出现过的源数
     sources           TEXT,                          -- 逗号分隔
     persistence_score REAL NOT NULL DEFAULT 0,      -- 持续度综合分
+    -- 标记位：只要该词条在任意一轮被标为广告位/置顶，即置 1（累积 OR，不回退）
+    is_ad             INTEGER NOT NULL DEFAULT 0,
+    is_top            INTEGER NOT NULL DEFAULT 0,
     updated_at        TEXT NOT NULL
 );
 
