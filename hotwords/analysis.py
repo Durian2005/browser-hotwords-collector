@@ -310,6 +310,7 @@ def compute_persistence_score(
 def _exclude_clause(
     exclude: set[tuple[str, str]] | None,
     exclude_labels: set[tuple[str, int]] | None = None,
+    prefix: str = "",
 ) -> tuple[str, list]:
     """把排除规则编译成 SQL 片段。返回 (sql_fragment, params)。
 
@@ -320,13 +321,17 @@ def _exclude_clause(
       - exclude_labels {(source, label_id)}：只排除带该徽标的【条目】。
         用于抖音「挑战」话题 —— 活动话题和真实热搜混在同一张榜里，
         整榜排除会把真热点一起扔掉，所以只能按条目排。
+
+    prefix 用于给列名加表别名（如 "s."）。不做字符串替换 ——
+    调用方各自拼别名迟早会拼错，而拼错了 SQL 还能跑、只是过滤条件
+    悄悄失效，属于最难查的那类 bug。
     """
     ors, params = [], []
     for src, cat in sorted(exclude or ()):
-        ors.append("(source=? AND category=?)")
+        ors.append(f"({prefix}source=? AND {prefix}category=?)")
         params.extend([src, cat])
     for src, lab in sorted(exclude_labels or ()):
-        ors.append("(source=? AND label_id=?)")
+        ors.append(f"({prefix}source=? AND {prefix}label_id=?)")
         params.extend([src, lab])
     if not ors:
         return "", []
