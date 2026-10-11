@@ -12,12 +12,18 @@ REM  run.bat 5           = overview + alerts
 REM  run.bat 6           = scheduler (keep running)
 REM  run.bat test        = run tests
 REM
-REM  Python interpreter:
-REM    defaults to `python` on PATH -- activate your venv first
-REM    (see README "Quick start"). To pin a specific interpreter:
-REM        set HOTWORDS_PY=C:\path\to\python.exe
+REM  Python interpreter (priority order):
+REM    1) %HOTWORDS_PY% if already set
+REM    2) .venv\Scripts\python.exe   (project virtualenv -- recommended)
+REM    3) venv\Scripts\python.exe
+REM    4) `python` on PATH           (fallback)
+REM
+REM  If you see "No module named 'yaml'", the wrong interpreter was picked:
+REM  create a .venv in this folder, or set HOTWORDS_PY to the right python.exe.
 REM ============================================================
 setlocal
+if not defined HOTWORDS_PY if exist "%~dp0.venv\Scripts\python.exe" set "HOTWORDS_PY=%~dp0.venv\Scripts\python.exe"
+if not defined HOTWORDS_PY if exist "%~dp0venv\Scripts\python.exe" set "HOTWORDS_PY=%~dp0venv\Scripts\python.exe"
 if not defined HOTWORDS_PY set HOTWORDS_PY=python
 set PY=%HOTWORDS_PY%
 cd /d %~dp0
@@ -35,6 +41,7 @@ if "%~1"=="report" goto report
 if "%~1"=="cross"  goto cross
 if "%~1"=="track"  goto track
 if "%~1"=="trend"  goto trend
+if "%~1"=="retrack" goto retrack
 if "%~1"=="help"   goto help
 goto once
 
@@ -93,8 +100,9 @@ goto done
 
 :run
 echo.
-echo   Running scheduler. Press Ctrl+C to stop.
-"%PY%" -m hotwords run
+echo   Running scheduler (full round, Ctrl+C to stop).
+echo   Log: logs\scheduler.log
+"%PY%" -m hotwords --log-file logs\scheduler.log run
 goto done
 
 :test
@@ -102,11 +110,17 @@ echo.
 "%PY%" tests\test_basic.py
 goto done
 
+:retrack
+echo.
+"%PY%" -m hotwords retrack
+goto done
+
 :done
 echo.
 echo   ==================================
 echo    Done. Press any key to close.
 echo   ==================================
+echo    interpreter: %PY%
 pause >nul
 goto end
 
