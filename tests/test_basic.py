@@ -526,6 +526,161 @@ def test_scheduler_stop_diagnostics():
         lg.setLevel(old_level)
 
 
+def _add_run(repo, groups, status="ok"):
+    """测试助手：往库里压一轮快照。
+
+    groups = [(source, category, [(rank, word), ...]), ...]
+    """
+    from hotwords.models import HotItem, ParseResult
+
+    rid = repo.start_run()
+    for source, category, entries in groups:
+        items = [HotItem(source=source, category=category, rank=r, word=w)
+                 for r, w in entries]
+        repo.save_snapshot(rid, ParseResult(source, category, items, {"word"}))
+        repo.upsert_words(items)
+    repo.finish_run(rid, status, {})
+    return rid
+
+
+def test_emergence_new_and_rise():
+    """突现检测：新词 / 名次跃升 / 跨源加权 三类信号都要可复现。
+
+    这组断言是模块的立身之本 —— 持续度靠跨轮累加，新词天然吃亏；
+    本模块反过来放大"刚冒出来"的信号，所以必须能区分
+    「全新」与「连续在榜但窜升」两种完全不同的情况。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.emergence import W_CROSS, W_DELTA, W_NEW, detect_emergence
+    from hotwords.storage import Repository
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            _add_run(repo, [("baidu_hot", "realtime", [(10, "A词")])])
+            _add_run(repo, [("baidu_hot", "realtime", [(8, "A词"), (5, "B词")])])
+            # 末轮：A 冲到第 2，B 微升，C 全新且同时在两个源出现
+            _add_run(repo, [
+                ("baidu_hot", "realtime", [(2, "A词"), (4, "B词"), (1, "C词")]),
+                ("weibo_hot", "main", [(3, "C词")]),
+            ])
+
+            got = {e.word: e for e in detect_emergence(repo, limit=10)}
+            assert set(got) == {"A词", "B词", "C词"}, sorted(got)
+
+            a = got["A词"]
+            assert a.is_new is False and a.rounds_absent == 0
+            assert a.prev_rank == 8 and a.rank_delta == 6
+            assert a.score == 28 + 6 * W_DELTA, a.score  # 第2名+28 + 升6位
+
+            c = got["C词"]
+            assert c.is_new is True and c.rounds_absent is None
+            # 全新词没有"上轮"，就不该编一个 delta 出来
+            assert c.prev_rank is None and c.rank_delta is None
+            assert c.best_rank == 1, "取两源里的最好名次"
+            assert c.sources == ["baidu_hot", "weibo_hot"]
+            assert c.score == W_NEW + 29 + W_CROSS, c.score  # 新词+35 + 第1名+29 + 2源+12
+
+            # 排序：新词 > 跃升幅度大的 A > 微升的 B
+            assert [e.word for e in detect_emergence(repo, limit=10)] == ["C词", "A词", "B词"]
+        finally:
+            repo.close()
+
+
+def test_emergence_reentry_and_item_exclude():
+    """断档回归不能当成"新词"；条目级排除在看板入口同样要生效。
+
+    若回归被误判为新词，它会白拿 +35 压过真正首秀的词；
+    而排除清单若只在 CLI 生效、看板不生效，同一个库会给出两张互相打架的榜。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.emergence import detect_emergence, rank_series
+    from hotwords.models import HotItem, ParseResult
+    from hotwords.storage import Repository
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            _add_run(repo, [("baidu_hot", "realtime", [(5, "A词")])])
+            _add_run(repo, [("baidu_hot", "realtime", [(1, "B词")])])  # A 缺席一轮
+
+            rid = repo.start_run()
+            items = [
+                HotItem(source="baidu_hot", category="realtime", rank=4, word="A词"),
+                HotItem(source="douyin_hot", category="main", rank=1, word="挑战词",
+                        label="挑战", label_id=9, sub_board="[3]"),
+            ]
+            repo.save_snapshot(rid, ParseResult("baidu_hot", "realtime", items, {"word"}))
+            repo.upsert_words(items)
+            repo.finish_run(rid, "ok", {})
+
+            got = {e.word: e for e in detect_emergence(
+                repo, limit=10, exclude_labels={("douyin_hot", 9)})}
+            assert "挑战词" not in got, "带排除徽标的条目不应出现在突现榜"
+
+            a = got["A词"]
+            assert a.is_new is False, "断档回归不是新词"
+            assert a.rounds_absent == 1, a.rounds_absent
+            assert a.prev_rank == 5 and a.rank_delta == 1
+            assert a.score == 20 + 26 + 1 * 0.8, a.score  # 回归+20 + 第4名+26 + 升1位
+
+            # 轨迹图：缺席那一轮必须是 None（断开），不能是 0 或沿用上轮
+            labels, series = rank_series(repo, ["A词"])
+            assert len(labels) == 3
+            assert series["A词"] == [5, None, 4], series["A词"]
+        finally:
+            repo.close()
+
+
+def test_emergence_and_series_on_empty_db():
+    """空库不能抛异常 —— 看板在"刚建库还没跑过"时也要能生成。"""
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.emergence import detect_emergence, rank_series
+    from hotwords.storage import Repository
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            assert detect_emergence(repo, limit=10) == []
+            assert rank_series(repo, ["不存在"]) == ([], {})
+            # 有轮次但没有词也不能炸
+            repo.finish_run(repo.start_run(), "ok", {})
+            assert detect_emergence(repo, limit=10) == []
+            assert rank_series(repo, []) == ([], {})
+        finally:
+            repo.close()
+
+
+def test_emergence_ignores_failed_runs():
+    """failed 轮不能参与"上次出现"的判定，否则会把断档算成连续。"""
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.emergence import detect_emergence
+    from hotwords.storage import Repository
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            _add_run(repo, [("baidu_hot", "realtime", [(5, "A词")])])
+            # 这一轮采集失败（比如源挂了），快照里没有 A，但它不该算"断档一轮"
+            _add_run(repo, [("baidu_hot", "realtime", [])], status="failed")
+            _add_run(repo, [("baidu_hot", "realtime", [(3, "A词")])])
+
+            got = {e.word: e for e in detect_emergence(repo, limit=10)}
+            a = got["A词"]
+            assert a.rounds_absent == 0, f"failed 轮不应计入断档，实际 {a.rounds_absent}"
+            assert a.prev_rank == 5 and a.rank_delta == 2
+        finally:
+            repo.close()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
