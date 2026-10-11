@@ -40,6 +40,48 @@ class BaseFetcher:
         raise NotImplementedError
 
 
+def ca_bundle_arg() -> bool | str:
+    """给 curl_cffi 的 verify 参数算出可用的 CA 路径。
+
+    ⚠️ Windows 上的真实坑（实测 2026-10-11）：
+      libcurl 打不开【非 ASCII 路径】的 CA 文件。本项目正好落在一个中文目录，
+      于是 certifi 默认给出的
+          E:\\<中文目录>\\.venv\\Lib\\site-packages\\certifi\\cacert.pem
+      会直接失败：
+          curl: (77) error adding trust anchors from locations: CAfile: ...
+      而同一份 pem 换到纯 ASCII 路径（C:\\Temp\\cacert.pem）就 200。
+      交叉验证过：ASCII 路径 OK / 默认中文路径 FAIL / 其余条件完全相同。
+
+    处理：路径含非 ASCII 时，把 pem 复制到 %LOCALAPPDATA%（通常为 ASCII）再引用。
+    注意【绝不】退回 verify=False —— 那等于关掉证书校验，是安全倒退；
+    复制失败时宁可沿用原路径（大不了请求失败），也不降低校验强度。
+    """
+    import certifi
+    from pathlib import Path
+
+    pem = Path(certifi.where())
+    if str(pem).isascii():
+        return True  # 路径本身没问题，交回 curl_cffi 默认处理
+
+    import os
+    import shutil
+    import tempfile
+
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    if not str(base).isascii():
+        return True  # 兜底目录也是非 ASCII，无能为力，不降级校验
+
+    dst = Path(base) / "hotwords" / "cacert.pem"
+    try:
+        if not dst.exists() or dst.stat().st_size != pem.stat().st_size:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(pem, dst)
+        return str(dst)
+    except OSError as e:  # 复制失败：保持原样，请求可能失败但不降级
+        logger.warning("CA 复制到 ASCII 路径失败（%s），沿用原路径", e)
+        return True
+
+
 class CurlCffiFetcher(BaseFetcher):
     """curl_cffi：TLS/HTTP2 指纹伪装，仅几 MB，无需浏览器。
 
@@ -55,6 +97,7 @@ class CurlCffiFetcher(BaseFetcher):
 
         self._req = _req
         self._impersonate = impersonate
+        self._verify = ca_bundle_arg()
 
     def fetch(self, url: str, headers: dict[str, str], timeout: int = 15) -> tuple[int, str]:
         resp = self._req.get(
@@ -62,6 +105,7 @@ class CurlCffiFetcher(BaseFetcher):
             headers=headers,
             impersonate=self._impersonate,
             timeout=timeout,
+            verify=self._verify,
         )
         return resp.status_code, resp.text
 
