@@ -681,6 +681,81 @@ def test_emergence_ignores_failed_runs():
             repo.close()
 
 
+def test_axis_labels_switch_to_run_index():
+    """横轴标签：同日密集多轮必须换成 #N，否则一排全是 "10-11"。
+
+    实测踩过：生命曲线 20 轮全在同一天，标签被截成同一个 "10-11"，
+    根本看不出是哪一轮。判据是「时间区分度」而不是「轮次数」，
+    所以两条分支都要锁住。
+    """
+    from hotwords.render import _axis_labels
+
+    # 1) 轮次不多、间隔够大（每小时一轮）→ 保留时间标签
+    far = [f"2026-10-11T{h:02d}:00:00+08:00" for h in range(6, 18)]
+    got = _axis_labels(far)
+    assert got[0] == "06:00:00" and got[-1] == "17:00:00", got
+
+    # 2) 轮次不多但间隔太密（每分钟一轮）→ 换轮次序号（时间分支）
+    tight = [f"2026-10-11T21:{m:02d}:00+08:00" for m in range(12)]
+    assert _axis_labels(tight) == [f"#{i+1}" for i in range(12)]
+
+    # 3) 跨天但轮次太多 → 同样换序号（数量分支）
+    many = [f"2026-10-{d:02d}T12:00:00+08:00" for d in range(1, 15)]
+    assert _axis_labels(many) == [f"#{i+1}" for i in range(14)]
+
+    # 4) 边界：0 / 1 轮不能抛
+    assert _axis_labels([]) == []
+    assert _axis_labels(["2026-10-11T21:00:00+08:00"]) == ["21:00:00"]
+
+    # 5) 时间戳是脏数据（老库/手改）也不能炸，退化成时间标签分支
+    assert len(_axis_labels(["bad", "worse"])) == 2
+
+
+def test_dashboard_axis_labels_aligned():
+    """看板各图横轴必须共用一套标签，且生命曲线窗口对齐到末尾。
+
+    折线图用全量标签、生命曲线用窗口标签，早先两边各算各的
+    （一个 #N、一个截断时间戳），同一页两张图横轴对不上。这里把
+    「窗口标签 = 全量标签的后 N 个」这条关系直接锁住。
+    """
+    import json
+    import re
+    import tempfile
+    from pathlib import Path
+
+    from hotwords.models import HotItem, ParseResult
+    from hotwords.render import render_dashboard
+    from hotwords.storage import Repository
+
+    total = 25
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        repo = Repository(Path(td) / "t.db")
+        try:
+            for i in range(total):
+                rid = repo.start_run()
+                items = [HotItem(source="baidu_hot", category="realtime",
+                                 rank=(i % 5) + 1, word="A词")]
+                repo.save_snapshot(
+                    rid, ParseResult("baidu_hot", "realtime", items, {"word"}))
+                repo.upsert_words(items)
+                repo.finish_run(rid, "ok", {})
+
+            out = Path(td) / "d.html"
+            render_dashboard(repo, str(out))
+            d = json.loads(re.search(
+                r"const D = (\{.*?\});\n", out.read_text(encoding="utf-8"), re.S
+            ).group(1))
+
+            rl, ll = d["runLabels"], d["lifeLabels"]
+            assert rl == [f"#{i+1}" for i in range(total)], rl[:3]
+            assert ll, "生命曲线窗口不该为空（应有非新词的轨迹可画）"
+            assert len(ll) < len(rl), "窗口应短于全量，否则这条断言没意义"
+            assert ll == rl[-len(ll):], (ll, rl[-len(ll):])
+            assert len(set(ll)) == len(ll), "窗口内标签不得重复"
+        finally:
+            repo.close()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
