@@ -42,6 +42,31 @@ def _q1(v: float) -> str:
     return f"{v:.1f}"
 
 
+def _axis_labels(timestamps: list[str]) -> list[str]:
+    """把逐轮时间戳转成横轴标签。
+
+    时间跨度小或轮次多时，时间标签会大量重复（同一天连跑十几轮 →
+    一排全是 "10-11"），改用轮次序号 #N。
+    看板每张图都必须走这里：早先折线图用 #N、生命曲线用 "10-11"，
+    同一页两张图横轴口径不同，读者没法把它们对上（实测踩到）。
+    """
+    labels = [t[11:19] for t in timestamps]
+    n = len(timestamps)
+    if n <= 1:
+        return labels
+    try:
+        from datetime import datetime as _dt
+        span_min = (
+            _dt.fromisoformat(timestamps[-1]) - _dt.fromisoformat(timestamps[0])
+        ).total_seconds() / 60
+    except (ValueError, TypeError):
+        span_min = 999
+    # 平均每轮间隔不足 3 分钟，说明时间戳区分度不够
+    if span_min / max(n - 1, 1) < 3 or n > 12:
+        labels = [f"#{i+1}" for i in range(n)]
+    return labels
+
+
 def render_dashboard(
     repo, out_path: str = "dashboard.html", last_n: int = 0,
     config_path: str | None = None,
@@ -64,23 +89,13 @@ def render_dashboard(
     _limit_p = (last_n,) if (last_n and last_n > 0) else ()
     runs = repo.conn.execute(
         "SELECT run_id, started_at, status FROM run WHERE status IN ('ok','partial') "
-        f"ORDER BY started_at ASC {_limit_sql}",
+        f"ORDER BY started_at ASC, rowid ASC {_limit_sql}",
         _limit_p,
     ).fetchall()
-    run_labels = [r["started_at"][11:19] for r in runs]
     run_ids = [r["run_id"] for r in runs]
-    # 若整体时间跨度过小（如测试期密集跑，或日常高频采集），
-    # 时间标签会挤成一团看不出趋势 —— 改用轮次序号。
-    if len(run_ids) > 1:
-        first, last = runs[0]["started_at"], runs[-1]["started_at"]
-        try:
-            from datetime import datetime as _dt
-            span_min = (_dt.fromisoformat(last) - _dt.fromisoformat(first)).total_seconds() / 60
-        except (ValueError, TypeError):
-            span_min = 999
-        # 平均每轮间隔不足 3 分钟，说明时间戳区分度不够
-        if span_min / max(len(run_ids) - 1, 1) < 3 or len(run_ids) > 12:
-            run_labels = [f"#{i+1}" for i in range(len(run_ids))]
+    # 排序键与 emergence._run_index 保持一致：生命曲线的窗口标签要靠
+    # 这份全局标签做切片对齐，两边顺序差一位就会张冠李戴。
+    run_labels = _axis_labels([r["started_at"] for r in runs])
 
     # 每轮每源条目数
     timeline: dict[str, list[int]] = defaultdict(lambda: [0] * len(run_ids))
@@ -165,7 +180,10 @@ def render_dashboard(
     # 默认只取最近 20 轮：轨迹图看的是"最近怎么上来的"，
     # 把 98 轮全铺上去只会让折线糊成一片。显式传 --last 时按用户的来。
     life_n = last_n if (last_n and last_n > 0) else 20
-    life_labels, life_series = rank_series(repo, track_words, last_n=life_n)
+    life_raw, life_series = rank_series(repo, track_words, last_n=life_n)
+    # 横轴口径与其它图统一：直接切全局轮次标签，而不是各画各的时间戳。
+    # 两个查询的过滤条件与排序键相同（见上），所以切片是对齐的。
+    life_labels = run_labels[-len(life_raw):] if life_raw else []
 
     # ---- 统计卡 ----
     total_rows = len(rows)
@@ -506,6 +524,25 @@ renderCross();
 renderMarked();
 renderEmergence();
 
+// x 轴刻度挑拣：按可用像素宽度自适应步长。
+// 原先写死 i%2，短跑时够用，但长跑 49 轮时仍会排出 25 个标签，
+// 而绘图区只有 ~500px（每个标签约 20px、文本本身要 ~30px）→ 叠成一条灰带。
+// 改成先量最宽标签、再算步长，保证相邻刻度不碰撞；
+// 末轮（最新一轮）始终保留，否则右端看起来像数据缺了一段。
+function pickTicks(labels, pxPerStep){
+  const n = labels.length;
+  if(n === 0) return [];
+  if(n === 1) return [0];
+  const maxChars = Math.max(...labels.map(l => String(l).slice(0, 5).length));
+  const need = maxChars * 6.6 + 10;              // 11px 字体近似字宽 + 呼吸间距
+  const step = Math.max(1, Math.ceil(need / Math.max(pxPerStep, 0.001)));
+  const out = [];
+  for(let i = 0; i < n; i += step) out.push(i);
+  // 末轮替换掉前一个刻度（而不是硬塞）：两者间距至少 step，不会新造出碰撞
+  if(out[out.length - 1] !== n - 1) out[out.length - 1] = n - 1;
+  return out;
+}
+
 // 排名折线图（排名走势 / 突现词轨迹 共用）
 // 抽成一个函数而不是复制一份：两处折线的断线语义（None 必须断开）和
 // y 轴自适应逻辑完全一致，复制出去迟早会只改一处。
@@ -533,12 +570,12 @@ function drawRankChart(container, labels, series, emptyMsg){
   for(let s=0;s<=steps;s++){
     const t=Math.round(minR+(maxR-minR)*s/steps);
     svg+=`<line class="axis" x1="${PL}" y1="${y(t)}" x2="${W-PR}" y2="${y(t)}"/>`;
-    svg+=`<text class="axis-text" x="${PL-8}" y="${y(t)+4}" text-anchor="end">${t}</text>`;
+    svg+=`<text class="axis-text" x="${PL-8}" y="${Math.round(y(t))+4}" text-anchor="end">${t}</text>`;
   }
-  // x 轴标签（轮次）
-  labels.forEach((lb,i)=>{
-    if(labels.length>8 && i%2!==0 && i!==labels.length-1) return;
-    svg+=`<text class="axis-text" x="${x(i)}" y="${H-PB+18}" text-anchor="middle">${lb.slice(0,5)}</text>`;
+  // x 轴标签（轮次）：自适应步长，避免长跑后挤成一团
+  pickTicks(labels, iw / Math.max(labels.length - 1, 1)).forEach(i=>{
+    svg+=`<text class="axis-text" x="${Math.round(x(i))}" y="${H-PB+18}" `
+       + `text-anchor="middle">${labels[i].slice(0,5)}</text>`;
   });
   // 折线：null 处必须断开（started=false），连成直线会假造出"一直在榜"
   words.forEach((w,wi)=>{
@@ -588,11 +625,12 @@ drawRankChart('trend', D.runLabels, D.trendSeries, '需要多轮数据才能显�
   let svg=`<svg viewBox="0 0 ${W} ${H}">`;
   [0,maxT].forEach(t=>{
     svg+=`<line class="axis" x1="${PL}" y1="${yv(t)}" x2="${W-PR}" y2="${yv(t)}"/>`;
-    svg+=`<text class="axis-text" x="${PL-8}" y="${yv(t)+4}" text-anchor="end">${t}</text>`;
+    svg+=`<text class="axis-text" x="${PL-8}" y="${Math.round(yv(t))+4}" text-anchor="end">${t}</text>`;
   });
-  labels.forEach((lb,i)=>{
-    if(n>8 && i%2!==0 && i!==n-1) return;
-    svg+=`<text class="axis-text" x="${xc(i)}" y="${H-PB+18}" text-anchor="middle">${lb.slice(0,5)}</text>`;
+  // 与折线图同一套挑拣逻辑：柱心间距是 iw/n（不是 iw/(n-1)）
+  pickTicks(labels, iw / Math.max(n, 1)).forEach(i=>{
+    svg+=`<text class="axis-text" x="${Math.round(xc(i))}" y="${H-PB+18}" `
+       + `text-anchor="middle">${labels[i].slice(0,5)}</text>`;
   });
   for(let i=0;i<n;i++){
     let acc=0;
