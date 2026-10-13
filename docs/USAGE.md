@@ -60,7 +60,7 @@ pip install -r requirements.txt
 | `python -m hotwords alerts` | 查看告警 |
 | `python -m hotwords run` | 常驻调度 |
 | `python -m hotwords retrack` | 从快照重建持续上榜数据（改排除清单后必跑） |
-| `python tests/test_basic.py` | 跑测试（25 项） |
+| `python tests/test_basic.py` | 跑测试（27 项） |
 
 全局参数：`--db <路径>`（默认 `hotwords.db`）、`--config <路径>`、`-v`（详细日志）。
 
