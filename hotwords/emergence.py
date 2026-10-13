@@ -77,9 +77,16 @@ class Emergence:
 
 
 def _run_index(repo) -> tuple[dict[int, int], list[int]]:
-    """返回 (rowid -> 顺序下标, 顺序下标列表)。只算 ok/partial 轮。"""
+    """返回 (rowid -> 顺序下标, 顺序下标列表)。只算 ok/partial 轮。
+
+    排序键写成 (started_at, rowid)：只按 rowid 排，在"补录了更早时间戳的行"
+    这类情况下会与看板按 started_at 的排序分叉，而 rank_series 的窗口标签
+    依赖两边顺序一致（差一位就会把 A 轮的标签贴到 B 轮的数据上）。
+    加 rowid 作次键是为了同一秒内的多轮也有确定顺序。
+    """
     rows = repo.conn.execute(
-        "SELECT rowid FROM run WHERE status IN ('ok','partial') ORDER BY rowid"
+        "SELECT rowid FROM run WHERE status IN ('ok','partial') "
+        "ORDER BY started_at, rowid"
     ).fetchall()
     order = [r["rowid"] for r in rows]
     return {rn: i for i, rn in enumerate(order)}, order
@@ -203,8 +210,14 @@ def detect_emergence(
 def rank_series(repo, words: list[str], last_n: int | None = None) -> tuple[list[str], dict[str, list[int | None]]]:
     """取出若干词条的逐轮最佳名次，供看板画生命周期曲线。
 
-    返回 (轮次标签, {词: [每轮名次或 None]})。None 表示该轮不在榜 ——
+    返回 (轮次原始时间戳, {词: [每轮名次或 None]})。None 表示该轮不在榜 ——
     折线里必须断开，不能连成直线，否则会假造出"一直在榜"的错觉。
+
+    标签返回**未格式化的 started_at 全值**：怎么截断、要不要换成轮次序号
+    是展示层的事。早先在这里截成 "MM-DD HH:MM"，展示层又 slice(0,5) 砍一刀，
+    同一天连跑 20 轮就全变成 "10-11"，横轴一排完全一样，看不出是哪一轮。
+    窗口顺序与看板 runs 查询一致（同过滤条件 + 同排序键），
+    所以调用方可以直接用全局轮次标签去对齐长度。
     """
     order_map, order = _run_index(repo)
     if last_n:
@@ -213,9 +226,10 @@ def rank_series(repo, words: list[str], last_n: int | None = None) -> tuple[list
         return [], {}
 
     labels = [
-        r["started_at"][5:16]
+        r["started_at"]
         for r in repo.conn.execute(
-            f"SELECT started_at FROM run WHERE rowid IN ({','.join('?'*len(order))}) ORDER BY rowid",
+            f"SELECT started_at FROM run WHERE rowid IN ({','.join('?'*len(order))}) "
+            "ORDER BY started_at, rowid",
             order,
         ).fetchall()
     ]
